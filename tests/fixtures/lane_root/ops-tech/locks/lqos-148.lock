@@ -1,0 +1,21 @@
+{
+  "lane": "lqos-148",
+  "repo": "ops-tech",
+  "instance": "2026-06-17-001-claude",
+  "pid": 12345,
+  "target": "/Users/richie/projects-local/ops-tech-lqos-148",
+  "target_normalized": "/Users/richie/projects-local/ops-tech-lqos-148",
+  "note": "sample fixture claim (Slice 1, read-only board)",
+  "claimed_at": "2026-06-17T12:00:00Z",
+  "updated_at": "2026-06-17T12:00:00Z",
+  "expires_at": "2090-01-01T00:00:00Z",
+  "ttl_hours": 12,
+  "linear_key": "LQOS-148",
+  "branch": "richie/lqos-148-sample",
+  "role": "executor",
+  "pr_url": null,
+  "gate": "execute",
+  "plan_path": null,
+  "claim_status": "active",
+  "session_ref": "claude-3:0.0"
+}
