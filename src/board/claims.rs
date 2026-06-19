@@ -1,27 +1,44 @@
 //! Read authoritative claim lock records from the local lane root. No network, no git.
+//!
+//! Slice 2: this goes through the one shared [`crate::lock::record::read_claim`] reader,
+//! so `board`, `list`, and `status` agree on identity validation, transient-`NotFound`
+//! skipping (a lock unlinked mid-scan is skipped, not an error), and fail-closed
+//! handling of malformed/identity-inconsistent records (typed [`LaneError`], exit 2).
 
-use anyhow::Context;
 use std::fs;
 use std::path::Path;
 
+use crate::error::LaneError;
+use crate::lock::{record, StdFs};
 use crate::model::ClaimRecord;
 
-/// Read all `*.lock` claim records under `lane_root/<repo>/locks/`, optionally
-/// filtered to a single repo namespace. A missing lane root yields an empty list.
+/// Read all `*.lock` claim records under `lane_root/<repo>/locks/`, optionally filtered
+/// to a single repo namespace. A missing lane root yields an empty list. A malformed or
+/// identity-inconsistent record fails closed (exit 2); a lock that vanishes mid-scan is
+/// skipped.
 pub fn read_claims(
     lane_root: &Path,
     repo_filter: Option<&str>,
-) -> anyhow::Result<Vec<ClaimRecord>> {
+    expected_uid: u32,
+) -> Result<Vec<ClaimRecord>, LaneError> {
     let mut out: Vec<ClaimRecord> = Vec::new();
-    if !lane_root.exists() {
-        return Ok(out);
-    }
 
-    let repo_dirs = fs::read_dir(lane_root)
-        .with_context(|| format!("read lane root {}", lane_root.display()))?;
+    let repo_dirs = match fs::read_dir(lane_root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(LaneError::Io(e)),
+    };
     for entry in repo_dirs {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+        let entry = entry.map_err(LaneError::Io)?;
+        let ft = entry.file_type().map_err(LaneError::Io)?;
+        // An interior symlink directly under the root fails closed; stray non-dirs skip.
+        if ft.is_symlink() {
+            return Err(LaneError::Identity(format!(
+                "interior state symlink (refusing to follow): {}",
+                entry.path().display()
+            )));
+        }
+        if !ft.is_dir() {
             continue;
         }
         let repo_name = entry.file_name().to_string_lossy().to_string();
@@ -30,42 +47,22 @@ pub fn read_claims(
                 continue;
             }
         }
+        // Guarded chain (rejects a symlinked repo/locks; never follows). Absent → skip.
         let locks_dir = entry.path().join("locks");
-        if !locks_dir.is_dir() {
-            continue;
+        match crate::lock::paths::guard_dir_chain(lane_root, &locks_dir, &StdFs, expected_uid)? {
+            crate::lock::paths::Presence::Absent => continue,
+            crate::lock::paths::Presence::Present => {}
         }
-        for lock in fs::read_dir(&locks_dir)
-            .with_context(|| format!("read locks dir {}", locks_dir.display()))?
-        {
-            let lock = lock?;
+        for lock in fs::read_dir(&locks_dir).map_err(LaneError::Io)? {
+            let lock = lock.map_err(LaneError::Io)?;
             let path = lock.path();
             if path.extension().and_then(|e| e.to_str()) != Some("lock") {
                 continue;
             }
-            let text =
-                fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-            let record: ClaimRecord = serde_json::from_str(&text)
-                .with_context(|| format!("parse claim {}", path.display()))?;
-            // Authoritative-identity guard: the record must agree with its location.
-            // Errors name the file + expected directory/stem (filesystem facts), never
-            // the record's contents.
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            anyhow::ensure!(
-                record.repo == repo_name,
-                "claim {}: `repo` field does not match its enclosing namespace directory '{}'",
-                path.display(),
-                repo_name
-            );
-            anyhow::ensure!(
-                record.lane == stem,
-                "claim {}: `lane` field does not match its filename stem '{}'",
-                path.display(),
-                stem
-            );
-            out.push(record);
+            match record::read_claim(&path, lane_root, expected_uid, &StdFs)? {
+                Some(rec) => out.push(rec),
+                None => continue, // transient NotFound — skip, not an error
+            }
         }
     }
 

@@ -1,4 +1,10 @@
-//! Command-line surface for Slice 1 (the `board` subcommand only).
+//! Command-line surface: the read-only `board` (Slice 1) plus the offline locking-core
+//! verbs `claim | renew | release | status | list` (Slice 2).
+//!
+//! `--instance` (or `$LANE_INSTANCE`) is required for claim/renew/release and is never
+//! guessed. `--force` exists ONLY on `claim` (the audited takeover); passing it to renew
+//! or release is a Clap usage error (exit 2). `--lane-root` overrides `$LANE_ROOT`, else
+//! `~/.lane`; absolute-only.
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
@@ -8,7 +14,7 @@ use std::path::PathBuf;
 #[command(
     name = "lane",
     version,
-    about = "Linear-first local agent-work orchestration (Slice 1: read-only board)"
+    about = "Linear-first local agent-work orchestration (offline lane locking core)"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -19,6 +25,101 @@ pub struct Cli {
 pub enum Command {
     /// Read-only, issue-keyed board of local lanes (offline; fixtures/stubs only).
     Board(BoardArgs),
+    /// Claim a lane (exactly-one-winner; `--force` audited takeover).
+    Claim(ClaimArgs),
+    /// Renew an owned lease (owner-only; no `--force`).
+    Renew(RenewArgs),
+    /// Release an owned lane (owner-only; no `--force`).
+    Release(ReleaseArgs),
+    /// Read-only status of one lane.
+    Status(StatusArgs),
+    /// Read-only listing of claims (all namespaces, or one `--repo`).
+    List(ListArgs),
+}
+
+/// `lane claim <lane> --repo <repo> [--target <abs>] [--ttl-hours <h>] [--note <s>] [--force] [--json]`
+#[derive(Args, Debug)]
+pub struct ClaimArgs {
+    /// Lane identifier (Linear key or slug); a single path component.
+    pub lane: String,
+    /// Repo namespace.
+    #[arg(long)]
+    pub repo: String,
+    /// Absolute worktree/target path to reserve (overlap-checked).
+    #[arg(long)]
+    pub target: Option<String>,
+    /// Lease length in hours (default 12, max 720).
+    #[arg(long)]
+    pub ttl_hours: Option<f64>,
+    /// Free-text note (non-secret; excluded from the audit log).
+    #[arg(long)]
+    pub note: Option<String>,
+    /// Take over an actively-held or malformed same-lane claim (audited; never bypasses
+    /// the target-overlap scan).
+    #[arg(long)]
+    pub force: bool,
+    /// Emit the JSON envelope instead of a human line.
+    #[arg(long)]
+    pub json: bool,
+    /// Override `$LANE_ROOT` (else `~/.lane`). Absolute path.
+    #[arg(long)]
+    pub lane_root: Option<PathBuf>,
+    /// Caller identity (required; or `$LANE_INSTANCE`). Never guessed.
+    #[arg(long)]
+    pub instance: Option<String>,
+}
+
+/// `lane renew <lane> --repo <repo> [--ttl-hours <h>] [--json]` (owner-only; no `--force`).
+#[derive(Args, Debug)]
+pub struct RenewArgs {
+    pub lane: String,
+    #[arg(long)]
+    pub repo: String,
+    #[arg(long)]
+    pub ttl_hours: Option<f64>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub lane_root: Option<PathBuf>,
+    #[arg(long)]
+    pub instance: Option<String>,
+}
+
+/// `lane release <lane> --repo <repo> [--json]` (owner-only; no `--force`).
+#[derive(Args, Debug)]
+pub struct ReleaseArgs {
+    pub lane: String,
+    #[arg(long)]
+    pub repo: String,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub lane_root: Option<PathBuf>,
+    #[arg(long)]
+    pub instance: Option<String>,
+}
+
+/// `lane status <lane> --repo <repo> [--json]` (read-only).
+#[derive(Args, Debug)]
+pub struct StatusArgs {
+    pub lane: String,
+    #[arg(long)]
+    pub repo: String,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub lane_root: Option<PathBuf>,
+}
+
+/// `lane list [--repo <repo>] [--json]` (read-only; all namespaces if `--repo` omitted).
+#[derive(Args, Debug)]
+pub struct ListArgs {
+    #[arg(long)]
+    pub repo: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub lane_root: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Default)]

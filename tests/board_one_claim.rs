@@ -7,7 +7,12 @@ use lane::board::worktrees::EmptyWorktreeProvider;
 use lane::board::{assemble, BoardInputs};
 use lane::model::{ClaimStatus, Gate, Liveness, Provenance, Role, StaleState};
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use tempfile::tempdir;
+
+fn uid_of(p: &std::path::Path) -> u32 {
+    std::fs::metadata(p).unwrap().uid()
+}
 
 fn lock_json(lane: &str, claimed: &str, updated: &str, expires: &str) -> String {
     format!(
@@ -45,6 +50,7 @@ fn one_active_claim_yields_one_row() {
     let inputs = BoardInputs {
         lane_root: dir.path(),
         repo_filter: None,
+        expected_uid: uid_of(dir.path()),
         now,
         worktrees: &wt,
         linear: &lin,

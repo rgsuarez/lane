@@ -40,6 +40,8 @@ pub fn classify_stale(claim: &ClaimRecord, now: DateTime<Utc>, liveness: Livenes
 pub struct BoardInputs<'a> {
     pub lane_root: &'a Path,
     pub repo_filter: Option<&'a str>,
+    /// Owner uid the guarded reader requires of every claim file (the lane root's owner).
+    pub expected_uid: u32,
     pub now: DateTime<Utc>,
     pub worktrees: &'a dyn WorktreeProvider,
     pub linear: &'a dyn LinearProvider,
@@ -48,7 +50,7 @@ pub struct BoardInputs<'a> {
 
 /// Assemble the board from authoritative claims + provider joins. Read-only.
 pub fn assemble(inputs: &BoardInputs) -> anyhow::Result<Board> {
-    let claims = claims::read_claims(inputs.lane_root, inputs.repo_filter)?;
+    let claims = claims::read_claims(inputs.lane_root, inputs.repo_filter, inputs.expected_uid)?;
 
     let mut sources = vec![SourceFreshness {
         source: SourceKind::Claims,
@@ -115,7 +117,11 @@ pub fn assemble(inputs: &BoardInputs) -> anyhow::Result<Board> {
 
 /// Wire Slice-1 providers from CLI args, assemble the board, and print it. Read-only.
 pub fn run_board(args: &BoardArgs) -> anyhow::Result<()> {
-    let lane_root = cli::resolve_lane_root(args.lane_root.clone())?;
+    // Resolve the canonical LaneRoot (read-only: no dirs created) so the guarded reader
+    // has the local-FS-enforced root path + the expected owner uid.
+    let raw = cli::resolve_lane_root(args.lane_root.clone())?;
+    let home = std::env::var("HOME").ok();
+    let root = crate::lock::paths::LaneRoot::resolve(&raw, home.as_deref(), &crate::lock::StdFs)?;
     let now = Utc::now();
 
     let worktrees: Box<dyn WorktreeProvider> = match &args.worktree_fixture {
@@ -129,8 +135,9 @@ pub fn run_board(args: &BoardArgs) -> anyhow::Result<()> {
     let liveness = liveness::StubLivenessProvider;
 
     let inputs = BoardInputs {
-        lane_root: &lane_root,
+        lane_root: root.path(),
         repo_filter: args.repo.as_deref(),
+        expected_uid: root.expected_uid(),
         now,
         worktrees: worktrees.as_ref(),
         linear: linear.as_ref(),

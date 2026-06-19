@@ -18,7 +18,34 @@ fn default_linear_provider_is_offline() {
 fn manifest_declares_no_http_network_deps() {
     // Compile-time include of this crate's manifest; no runtime file IO, no TOML parser.
     let manifest = include_str!("../Cargo.toml");
-    const FORBIDDEN: &[&str] = &["reqwest", "hyper", "tokio", "ureq", "graphql_client"];
+    // The locking core is permanently offline and std-only: no network/HTTP client, no
+    // async runtime, no embedded DB, no raw-syscall shim. Adapters that add Git/Linear/
+    // 1Password/tmux/overseer are future, separately-gated slices that live OUTSIDE the
+    // core — they are not declared here.
+    const FORBIDDEN: &[&str] = &[
+        // HTTP / network
+        "reqwest",
+        "hyper",
+        "ureq",
+        "graphql_client",
+        "isahc",
+        "surf",
+        // async runtimes
+        "tokio",
+        "async-std",
+        "async_std",
+        "smol",
+        // embedded DB / KV
+        "rusqlite",
+        "sled",
+        "diesel",
+        "sqlx",
+        "rocksdb",
+        // raw-syscall shims (Slice 2 is std-only — no O_NOFOLLOW/libc path)
+        "libc",
+        "rustix",
+        "nix",
+    ];
     for line in manifest.lines() {
         // A dependency line is `name = "..."` or `name = { ... }`; the key is left of `=`.
         let key = line.split('=').next().map(str::trim).unwrap_or_default();

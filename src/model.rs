@@ -79,6 +79,11 @@ pub enum Gate {
 /// `pid` is informational only and never used for liveness.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClaimRecord {
+    /// Lock schema version. Slice 2 writes `Some(1)`; Slice 1 records and fixtures
+    /// without the key deserialize as `None`. Evolution rule: additive optional fields
+    /// only; never remove/repurpose a field without bumping this and updating readers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
     pub lane: String,
     pub repo: String,
     pub instance: String,

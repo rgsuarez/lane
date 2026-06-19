@@ -8,10 +8,13 @@
 
 pub mod board;
 pub mod cli;
+pub mod error;
+pub mod lock;
 pub mod model;
 pub mod output;
 
 pub use board::{assemble, classify_stale, BoardInputs};
+pub use error::{LaneError, Reason, RefusedReason};
 pub use model::{
     Board, BoardRow, ClaimRecord, Liveness, Provenance, Provenanced, SourceFreshness, SourceKind,
     StaleState,

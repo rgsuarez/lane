@@ -7,8 +7,13 @@ use lane::board::worktrees::EmptyWorktreeProvider;
 use lane::board::{assemble, BoardInputs};
 use lane::model::Board;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use tempfile::tempdir;
+
+fn uid_of(p: &Path) -> u32 {
+    std::fs::metadata(p).unwrap().uid()
+}
 
 fn write_lock(root: &Path, dir_repo: &str, file_stem: &str, rec_repo: &str, rec_lane: &str) {
     let locks = root.join(dir_repo).join("locks");
@@ -27,6 +32,7 @@ fn assemble_root(root: &Path) -> anyhow::Result<Board> {
     let inputs = BoardInputs {
         lane_root: root,
         repo_filter: None,
+        expected_uid: uid_of(root),
         now,
         worktrees: &wt,
         linear: &lin,

@@ -10,8 +10,13 @@ use lane::model::{
     ClaimRecord, Liveness, Provenance, Provenanced, SourceFreshness, SourceKind, StaleState,
 };
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use tempfile::tempdir;
+
+fn uid_of(p: &Path) -> u32 {
+    std::fs::metadata(p).unwrap().uid()
+}
 
 /// Returns `NotLive` for the lane named `orphan`, `Unknown` otherwise.
 struct FakeLiveness;
@@ -75,6 +80,7 @@ fn classifies_expired_orphan_and_stale() {
     let inputs = BoardInputs {
         lane_root: root,
         repo_filter: None,
+        expected_uid: uid_of(root),
         now,
         worktrees: &wt,
         linear: &lin,

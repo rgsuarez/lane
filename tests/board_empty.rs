@@ -6,7 +6,12 @@ use lane::board::liveness::StubLivenessProvider;
 use lane::board::worktrees::EmptyWorktreeProvider;
 use lane::board::{assemble, BoardInputs};
 use lane::model::SourceKind;
+use std::os::unix::fs::MetadataExt;
 use tempfile::tempdir;
+
+fn uid_of(p: &std::path::Path) -> u32 {
+    std::fs::metadata(p).unwrap().uid()
+}
 
 #[test]
 fn empty_lane_root_yields_no_rows() {
@@ -17,6 +22,7 @@ fn empty_lane_root_yields_no_rows() {
     let inputs = BoardInputs {
         lane_root: dir.path(),
         repo_filter: None,
+        expected_uid: uid_of(dir.path()),
         now: Utc::now(),
         worktrees: &wt,
         linear: &lin,
