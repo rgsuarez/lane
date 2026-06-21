@@ -2,7 +2,7 @@
 name = "lane"
 version = "0.0.0"
 edition = "2021"
-description = "Linear-first local agent-work orchestration — read-only board (Slice 1 skeleton)"
+description = "Portable, offline-capable local agent-work orchestration — local lane claims, leases, target-overlap, and audit"
 license = "MIT"
 publish = false
 
