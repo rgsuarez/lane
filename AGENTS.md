@@ -4,6 +4,13 @@ Durable rules for any agent working in this repo. Read before editing. The full 
 is in `docs/lane_SPEC.md` and the master plan
 (`~/.claude/plans/plan-mode-build-the-gleaming-donut.md`).
 
+**Current status & next work (read on cold boot):** as-built = Slices 0a/1/2 (offline
+locking core; `main` @ the latest commit; 117 tests). Full context + the next steps are in
+`session-journals/2026-06-21-002-NEXT-SESSION-HANDOFF.md` (build journal: the `…-001-…`
+file). Next slice = **3 (lifecycle + pairing + git-worktree automation + zeos skill-wrap)**.
+The north star (a local app that *replaces Vantage in daily orchestration*) is **not yet
+realized** — much remains (Slices 0b/3/4/5; Vantage exit criteria 0/6).
+
 ## North star
 
 `lane` is a **portable, Linear-first, offline-capable local agent-work orchestration
