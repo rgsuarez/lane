@@ -19,9 +19,11 @@ use crate::lock::paths::LaneRoot;
 use crate::lock::target::Target;
 use crate::lock::{
     combine_warnings, read_liveness, reconcile_for_mutation, reconcile_for_status, record,
-    scan_overlap, ttl_to_duration, validate_instance, validate_name, validate_ttl, write_temp,
-    FsOps, ReleaseParams, ReleaseSuccess, RenewParams, RenewSuccess, StatusData,
+    scan_overlap, ttl_to_duration, validate_instance, validate_name, validate_note, validate_ttl,
+    write_temp, FsOps, HandoffParams, HandoffSuccess, ReleaseParams, ReleaseSuccess, RenewParams,
+    RenewSuccess, StatusData,
 };
+use crate::model::ClaimStatus;
 
 /// Renew an owned lease. Refuses if missing (`not_held`), not the owner (`not_owner`),
 /// or already lapsed (`expired` — re-`claim` instead of renewing).
@@ -101,6 +103,88 @@ pub fn renew_core(
     let post = audit.append(&ev, false).err().map(|e| e.to_string());
 
     Ok(RenewSuccess {
+        lane: p.lane.clone(),
+        expires_at: newrec.expires_at,
+        audit_warning: combine_warnings(recon, post),
+    })
+}
+
+/// Hand off an owned lease: flip `claim_status -> handoff` (and optionally replace the
+/// note) so a successor can see the lane is offered, WITHOUT releasing it - the claim
+/// stays held and the TTL keeps ticking, so the target stays protected until the
+/// successor takes over. Owner-only with the exact renew posture: missing ⇒ `not_held`,
+/// not the owner ⇒ `not_owner`, lapsed ⇒ `expired` (a lapsed lease cannot be handed
+/// off). Re-handoff of an already-`handoff` claim is idempotent success (refreshes
+/// `updated_at`/note). Follows renew's owner-only lane-mutex rename-over pattern but
+/// SKIPS the target-mutex/overlap re-scan: handoff changes no target, so there is no
+/// overlap surface to re-validate. Non-destructive: one terminal `handoff` audit event,
+/// no intent/completion pair.
+pub fn handoff_core(
+    root: &LaneRoot,
+    p: &HandoffParams,
+    now: DateTime<Utc>,
+    fs: &dyn FsOps,
+    audit: &dyn AuditSink,
+) -> Result<HandoffSuccess, LaneError> {
+    validate_name("repo", &p.repo)?;
+    validate_name("lane", &p.lane)?;
+    validate_instance(&p.instance)?;
+    if let Some(n) = &p.note {
+        validate_note(n)?;
+    }
+
+    root.ensure_write_dirs(&p.repo, fs)?;
+    let uid = root.expected_uid();
+    crate::lock::audit::recover_if_needed(
+        &root.audit_path(&p.repo),
+        &p.repo,
+        &p.lane,
+        &p.instance,
+        now,
+        fs,
+        uid,
+    )?;
+
+    let _lane_guard = LaneMutex::acquire(&root.lane_mutex_path(&p.repo, &p.lane), fs, uid)?;
+    let recon = reconcile_for_mutation(root, &p.repo, &p.lane, fs)?;
+    let lock_path = root.lock_path(&p.repo, &p.lane);
+
+    // Guarded shared reader: missing ⇒ not_held; malformed/identity/symlink ⇒ fail closed.
+    let rec = record::read_claim(&lock_path, root.path(), uid, fs)?
+        .ok_or(LaneError::Refused(RefusedReason::NotHeld))?;
+    if rec.instance != p.instance {
+        return Err(LaneError::Refused(RefusedReason::NotOwner));
+    }
+    if now >= rec.expires_at {
+        return Err(LaneError::Refused(RefusedReason::Expired));
+    }
+
+    let mut newrec = rec.clone();
+    newrec.schema_version = Some(1);
+    newrec.claim_status = Some(ClaimStatus::Handoff);
+    newrec.updated_at = now;
+    if p.note.is_some() {
+        newrec.note = p.note.clone();
+    }
+
+    let temp = write_temp(root, &p.repo, &p.lane, &newrec, fs, uid)?;
+    if let Err(e) = fs.rename(&temp, &lock_path) {
+        let _ = fs.remove_file(&temp);
+        return Err(LaneError::Io(e));
+    }
+
+    let mut ev = AuditEvent::new(
+        AuditEventKind::Handoff,
+        &p.repo,
+        &p.lane,
+        &p.instance,
+        AuditOutcome::Ok,
+        now,
+    );
+    ev.op_id = Some(next_op_id());
+    let post = audit.append(&ev, false).err().map(|e| e.to_string());
+
+    Ok(HandoffSuccess {
         lane: p.lane.clone(),
         expires_at: newrec.expires_at,
         audit_warning: combine_warnings(recon, post),

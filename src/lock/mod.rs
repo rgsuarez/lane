@@ -113,6 +113,22 @@ pub struct RenewSuccess {
     pub audit_warning: Option<String>,
 }
 
+/// Inputs to [`renew_release::handoff_core`].
+pub struct HandoffParams {
+    pub repo: String,
+    pub lane: String,
+    pub instance: String,
+    /// Optional handoff digest replacing the claim note (non-secret; excluded from audit).
+    pub note: Option<String>,
+}
+
+/// Result of a successful handoff (the claim stays held; only `claim_status` flips).
+pub struct HandoffSuccess {
+    pub lane: String,
+    pub expires_at: DateTime<Utc>,
+    pub audit_warning: Option<String>,
+}
+
 /// Inputs to [`renew_release::release_core`].
 pub struct ReleaseParams {
     pub repo: String,
@@ -463,6 +479,11 @@ enum VerbData {
         lane: String,
         expires_at: DateTime<Utc>,
     },
+    Handoff {
+        lane: String,
+        claim_status: crate::model::ClaimStatus,
+        expires_at: DateTime<Utc>,
+    },
     Release {
         lane: String,
         present: bool,
@@ -613,6 +634,12 @@ fn human_success(
         ("renew", Some(VerbData::Renew { expires_at, .. })) => {
             format!("renewed {lane}; expires {}", expires_at.to_rfc3339())
         }
+        ("handoff", Some(VerbData::Handoff { expires_at, .. })) => {
+            format!(
+                "handoff {lane}; claim stays held, expires {}",
+                expires_at.to_rfc3339()
+            )
+        }
         ("release", _) => match outcome {
             Outcome::Released => format!("released {lane}"),
             _ => format!("{lane} was not held"),
@@ -656,7 +683,7 @@ fn human_success(
 // CLI runners — resolve environment, call the core, render the envelope, exit code.
 // ---------------------------------------------------------------------------
 
-use crate::cli::{ClaimArgs, ListArgs, ReleaseArgs, RenewArgs, StatusArgs};
+use crate::cli::{ClaimArgs, HandoffArgs, ListArgs, ReleaseArgs, RenewArgs, StatusArgs};
 
 fn home_env() -> Option<String> {
     std::env::var("HOME").ok()
@@ -741,6 +768,37 @@ fn run_renew_at(args: &RenewArgs, now: DateTime<Utc>) -> i32 {
         Ok((Outcome::Ok, Some(data), s.audit_warning))
     })();
     emit(args.json, "renew", repo, lane, result)
+}
+
+/// `lane handoff` runner.
+pub fn run_handoff(args: &HandoffArgs) -> i32 {
+    run_handoff_at(args, Utc::now())
+}
+
+fn run_handoff_at(args: &HandoffArgs, now: DateTime<Utc>) -> i32 {
+    let repo = Some(args.repo.clone());
+    let lane = Some(args.lane.clone());
+    let fs = StdFs;
+    let home = home_env();
+    let result = (|| -> Result<(Outcome, Option<VerbData>, Option<String>), CommandError> {
+        let instance = require_instance(args.instance.clone())?;
+        let root = resolve_root(args.lane_root.clone(), home.as_deref(), &fs)?;
+        let sink = audit::StdAuditSink::new(root.audit_path(&args.repo), root.expected_uid());
+        let params = HandoffParams {
+            repo: args.repo.clone(),
+            lane: args.lane.clone(),
+            instance,
+            note: args.note.clone(),
+        };
+        let s = renew_release::handoff_core(&root, &params, now, &fs, &sink)?;
+        let data = VerbData::Handoff {
+            lane: s.lane,
+            claim_status: crate::model::ClaimStatus::Handoff,
+            expires_at: s.expires_at,
+        };
+        Ok((Outcome::Ok, Some(data), s.audit_warning))
+    })();
+    emit(args.json, "handoff", repo, lane, result)
 }
 
 /// `lane release` runner.

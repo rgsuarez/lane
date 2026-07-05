@@ -29,6 +29,8 @@ pub enum Command {
     Claim(ClaimArgs),
     /// Renew an owned lease (owner-only; no `--force`).
     Renew(RenewArgs),
+    /// Flip an owned claim to handoff status without releasing it (owner-only).
+    Handoff(HandoffArgs),
     /// Release an owned lane (owner-only; no `--force`).
     Release(ReleaseArgs),
     /// Read-only status of one lane.
@@ -77,6 +79,25 @@ pub struct RenewArgs {
     pub repo: String,
     #[arg(long)]
     pub ttl_hours: Option<f64>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub lane_root: Option<PathBuf>,
+    #[arg(long)]
+    pub instance: Option<String>,
+}
+
+/// `lane handoff <lane> --repo <repo> [--note <digest>] [--json]` (owner-only). Flips
+/// `claim_status -> handoff` and optionally replaces the note; the claim STAYS HELD
+/// (TTL keeps ticking) so the target stays protected until a successor takes over.
+#[derive(Args, Debug)]
+pub struct HandoffArgs {
+    pub lane: String,
+    #[arg(long)]
+    pub repo: String,
+    /// Optional handoff digest replacing the claim note (non-secret).
+    #[arg(long)]
+    pub note: Option<String>,
     #[arg(long)]
     pub json: bool,
     #[arg(long)]
