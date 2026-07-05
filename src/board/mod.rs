@@ -52,7 +52,7 @@ pub struct BoardInputs<'a> {
 pub fn assemble(inputs: &BoardInputs) -> anyhow::Result<Board> {
     let claims = claims::read_claims(inputs.lane_root, inputs.repo_filter, inputs.expected_uid)?;
 
-    let mut sources = vec![SourceFreshness {
+    let claims_freshness = SourceFreshness {
         source: SourceKind::Claims,
         provenance: Provenance::Authoritative,
         ok: true,
@@ -62,10 +62,7 @@ pub fn assemble(inputs: &BoardInputs) -> anyhow::Result<Board> {
             claims.len(),
             inputs.lane_root.display()
         ),
-    }];
-    sources.push(inputs.worktrees.freshness(inputs.now));
-    sources.push(inputs.linear.freshness(inputs.now));
-    sources.push(inputs.liveness.freshness(inputs.now));
+    };
 
     let mut rows: Vec<BoardRow> = claims
         .iter()
@@ -107,6 +104,16 @@ pub fn assemble(inputs: &BoardInputs) -> anyhow::Result<Board> {
         (ka.is_none(), ka, &a.lane.value).cmp(&(kb.is_none(), kb, &b.lane.value))
     });
 
+    // Source freshness is computed AFTER the per-claim joins (order is load-bearing for
+    // the live worktree provider: a git failure discovered lazily during `for_claim`
+    // must be reflected in its `ok` flag). The EMITTED source order is unchanged.
+    let sources = vec![
+        claims_freshness,
+        inputs.worktrees.freshness(inputs.now),
+        inputs.linear.freshness(inputs.now),
+        inputs.liveness.freshness(inputs.now),
+    ];
+
     Ok(Board {
         schema_version: 0,
         generated_at: inputs.now,
@@ -124,9 +131,13 @@ pub fn run_board(args: &BoardArgs) -> anyhow::Result<()> {
     let root = crate::lock::paths::LaneRoot::resolve(&raw, home.as_deref(), &crate::lock::StdFs)?;
     let now = Utc::now();
 
-    let worktrees: Box<dyn WorktreeProvider> = match &args.worktree_fixture {
-        Some(path) => Box::new(worktrees::FixtureWorktreeProvider::from_file(path)?),
-        None => Box::new(worktrees::EmptyWorktreeProvider),
+    let git_runner = crate::git::StdGitRunner::new();
+    let worktrees: Box<dyn WorktreeProvider + '_> = match (&args.worktree_fixture, args.worktrees) {
+        (Some(path), _) => Box::new(worktrees::FixtureWorktreeProvider::from_file(path)?),
+        (None, cli::WorktreeSource::Git) => {
+            Box::new(worktrees::GitWorktreeProvider::new(&git_runner))
+        }
+        (None, cli::WorktreeSource::Off) => Box::new(worktrees::EmptyWorktreeProvider),
     };
     let linear: Box<dyn LinearProvider> = match &args.linear_fixture {
         Some(path) => Box::new(linear::FixtureLinearProvider::from_file(path)?),

@@ -380,6 +380,12 @@ impl<'a> GitAdapter<'a> {
         }))
     }
 
+    /// `git --version` succeeds: the cheap availability gate the live board provider
+    /// runs once before its first probe.
+    pub fn version_ok(&self) -> bool {
+        matches!(self.runner.run(&["--version"]), Ok(out) if out.success())
+    }
+
     /// The MAIN repository working directory a worktree belongs to, via
     /// `git -C <worktree> rev-parse --path-format=absolute --git-common-dir` (the shared
     /// `.git` dir; its parent is the main checkout). Used by `close` to run

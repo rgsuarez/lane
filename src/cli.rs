@@ -7,8 +7,19 @@
 //! `~/.lane`; absolute-only.
 
 use anyhow::Context;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+/// Board worktree-source selection. `board` is in the MUST-work-offline verb set, so the
+/// live git probe is OPT-IN and the default spawns nothing.
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorktreeSource {
+    /// No worktree enrichment (the offline default; spawns nothing).
+    #[default]
+    Off,
+    /// Probe each targeted claim's path with local git plumbing (fail-soft, bounded).
+    Git,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -229,6 +240,10 @@ pub struct BoardArgs {
     /// Slice-1 fixture: worktree list JSON file (offline; no `git` shell-out).
     #[arg(long)]
     pub worktree_fixture: Option<PathBuf>,
+    /// Worktree source: `off` (default; offline, spawns nothing) or `git` (live probe of
+    /// each targeted claim's path; fail-soft). A fixture flag overrides this.
+    #[arg(long, value_enum, default_value_t = WorktreeSource::Off)]
+    pub worktrees: WorktreeSource,
 }
 
 /// Resolve the lane root from the process environment: explicit flag, then
