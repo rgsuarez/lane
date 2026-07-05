@@ -76,7 +76,11 @@ impl FsOps for StdFs {
 // Parameters and success values (the inputs/outputs of the core verbs).
 // ---------------------------------------------------------------------------
 
-/// Inputs to [`claim::claim_core`].
+/// Inputs to [`claim::claim_core`]. The four lifecycle fields (`branch`, `linear_key`,
+/// `role`, `claim_status`) default to `None` and are written into the claim record when
+/// set — a plain `lane claim` never sets them, so its on-disk record is unchanged;
+/// `lane start` passes them so its claim carries the lifecycle facts from birth.
+#[derive(Default)]
 pub struct ClaimParams {
     pub repo: String,
     pub lane: String,
@@ -86,6 +90,10 @@ pub struct ClaimParams {
     pub ttl_hours: Option<f64>,
     pub note: Option<String>,
     pub force: bool,
+    pub branch: Option<String>,
+    pub linear_key: Option<String>,
+    pub role: Option<crate::model::Role>,
+    pub claim_status: Option<crate::model::ClaimStatus>,
 }
 
 /// Result of a successful claim.
@@ -464,9 +472,12 @@ pub enum Outcome {
 }
 
 /// Per-verb `data` payload (serialized inline; untagged is serialize-only here).
+/// `pub(crate)`: the lifecycle composition layer (`src/lifecycle.rs`) constructs the
+/// `Start`/`Close` variants and emits through the SAME single-envelope path — never a
+/// duplicate envelope implementation. Not part of the crate's public API.
 #[derive(Serialize)]
 #[serde(untagged)]
-enum VerbData {
+pub(crate) enum VerbData {
     Claim {
         lane: String,
         instance: String,
@@ -487,6 +498,23 @@ enum VerbData {
     Release {
         lane: String,
         present: bool,
+    },
+    Start {
+        lane: String,
+        instance: String,
+        expires_at: DateTime<Utc>,
+        worktree: String,
+        branch: String,
+        base: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
+    Close {
+        lane: String,
+        released: bool,
+        worktree_removed: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        skipped_missing_worktree: bool,
     },
     // Boxed: a `ClaimRecord` is far larger than the other variants (clippy large_enum_variant).
     Status(Box<StatusData>),
@@ -532,7 +560,8 @@ impl From<LaneError> for CommandError {
 }
 
 /// Render exactly one envelope (or human line) and return the process exit code.
-fn emit(
+/// `pub(crate)` for the lifecycle composition layer; not public API.
+pub(crate) fn emit(
     json: bool,
     verb: &'static str,
     repo: Option<String>,
@@ -644,6 +673,30 @@ fn human_success(
             Outcome::Released => format!("released {lane}"),
             _ => format!("{lane} was not held"),
         },
+        (
+            "start",
+            Some(VerbData::Start {
+                worktree,
+                branch,
+                expires_at,
+                warning,
+                ..
+            }),
+        ) => {
+            let w = warning
+                .as_deref()
+                .map(|w| format!("\nlane: warning: {w}"))
+                .unwrap_or_default();
+            format!(
+                "started {lane}: worktree {worktree} on branch {branch}; claim expires {}{w}",
+                expires_at.to_rfc3339()
+            )
+        }
+        ("close", Some(VerbData::Close { .. })) => match outcome {
+            Outcome::Released => format!("closed {lane}"),
+            _ => format!("{lane} was not held"),
+        },
+        ("close", None) => format!("{lane} was not held"),
         ("status", Some(VerbData::Status(sd))) => {
             if sd.present {
                 let ss = sd
@@ -689,7 +742,7 @@ fn home_env() -> Option<String> {
     std::env::var("HOME").ok()
 }
 
-fn resolve_root(
+pub(crate) fn resolve_root(
     arg: Option<PathBuf>,
     home: Option<&str>,
     fs: &dyn FsOps,
@@ -698,7 +751,7 @@ fn resolve_root(
     LaneRoot::resolve(&raw, home, fs)
 }
 
-fn require_instance(arg: Option<String>) -> Result<String, LaneError> {
+pub(crate) fn require_instance(arg: Option<String>) -> Result<String, LaneError> {
     arg.or_else(|| std::env::var("LANE_INSTANCE").ok())
         .ok_or_else(|| LaneError::Identity("--instance is required (or set $LANE_INSTANCE)".into()))
 }
@@ -726,6 +779,7 @@ fn run_claim_at(args: &ClaimArgs, now: DateTime<Utc>) -> i32 {
             ttl_hours: args.ttl_hours,
             note: args.note.clone(),
             force: args.force,
+            ..Default::default()
         };
         let s = claim::claim_core(&root, &params, now, &fs, &sink)?;
         let data = VerbData::Claim {

@@ -131,19 +131,19 @@ Use these styles consistently:
 1. `lane claim <lane> --repo <repo>`
 2. `lane renew <lane> --repo <repo>`
 3. `lane release <lane> --repo <repo>`
-4. `lane status <lane> --repo <repo>`
-5. `lane list [--repo <repo>]`
-6. `lane board [--repo <repo>]`
+4. `lane handoff <lane> --repo <repo>` (Slice 3: owner-only status flip, core verb)
+5. `lane status <lane> --repo <repo>`
+6. `lane list [--repo <repo>]`
+7. `lane board [--repo <repo>]` (`--worktrees git` opt-in live worktree probe)
+8. `lane start <lane> --repo <repo> --git-repo <path>` (Slice 3: composition verb)
+9. `lane close <lane> --repo <repo> [--remove-worktree]` (Slice 3: composition verb)
 
 ### 5.2 Planned commands
 
 1. `lane pull`
 2. `lane plan`
-3. `lane start`
-4. `lane pair`
-5. `lane handoff`
-6. `lane close`
-7. `lane migrate`
+3. `lane pair`
+4. `lane migrate`
 
 ### 5.3 CLI validation
 
@@ -201,10 +201,11 @@ Closed reason values:
 4. `mutex_busy`
 5. `expired`
 6. `not_held`
-7. `identity`
-8. `malformed`
-9. `non_local_root`
-10. `io`
+7. `dirty_worktree`
+8. `identity`
+9. `malformed`
+10. `non_local_root`
+11. `io`
 
 ## 6. Local state root
 
@@ -608,11 +609,12 @@ Audit event kinds:
 2. `claim_refused`
 3. `renew`
 4. `release`
-5. `intent`
-6. `completion`
-7. `takeover`
-8. `malformed`
-9. `audit_recovery`
+5. `handoff`
+6. `intent`
+7. `completion`
+8. `takeover`
+9. `malformed`
+10. `audit_recovery`
 
 Audit outcomes:
 

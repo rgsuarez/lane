@@ -380,6 +380,36 @@ impl<'a> GitAdapter<'a> {
         }))
     }
 
+    /// The MAIN repository working directory a worktree belongs to, via
+    /// `git -C <worktree> rev-parse --path-format=absolute --git-common-dir` (the shared
+    /// `.git` dir; its parent is the main checkout). Used by `close` to run
+    /// `worktree remove` from the owning repo, since the claim record carries only the
+    /// worktree path.
+    pub fn main_repo_of(&self, worktree: &Path) -> Result<PathBuf, GitError> {
+        let path_s = path_str(worktree)?;
+        let out = self.runner.run(&[
+            "-C",
+            path_s,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])?;
+        if !out.success() {
+            return Err(GitError::Plumbing {
+                code: out.code,
+                stderr: out.stderr,
+            });
+        }
+        let common = PathBuf::from(out.stdout.trim());
+        common
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| GitError::Plumbing {
+                code: Some(0),
+                stderr: format!("git-common-dir has no parent: {}", common.display()),
+            })
+    }
+
     /// Read-only prechecks for `start`, run BEFORE any claim: the repo must be a real git
     /// repo, the branch must not already exist, and the worktree path must not exist. On
     /// success the target is safe to create (and the branch is known-absent, so a later

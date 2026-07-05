@@ -32,14 +32,19 @@ Vantage-compatible** — the core runtime never calls Vantage.
 
 ## The locking core is permanently offline
 
-`claim / renew / release / status / list / board` MUST work with **no** Linear / GitHub /
-1Password / Vantage / homebox / overseer / tmux / network / daemon / DB / async. They
-touch only local files under `$LANE_ROOT` (override with `--lane-root`; absolute, local
-filesystem only — NFS is rejected because advisory locks are unreliable there).
+`claim / renew / release / handoff / status / list / board` MUST work with **no** Linear /
+GitHub / 1Password / Vantage / homebox / overseer / tmux / network / daemon / DB / async.
+They touch only local files under `$LANE_ROOT` (override with `--lane-root`; absolute, local
+filesystem only — NFS is rejected because advisory locks are unreliable there). `board`'s
+worktree enrichment is OPT-IN (`--worktrees git`); the default spawns nothing and touches
+nothing outside `$LANE_ROOT`.
 
-This does **not** prohibit future *adapter* modules (Git worktree, Linear GraphQL,
-1Password, tmux/overseer liveness). Those are **separate, later, gated slices that live
-outside the locking core** and never make the core itself reach the network.
+This does **not** prohibit *adapter* modules (Git worktree, Linear GraphQL, 1Password,
+tmux/overseer liveness). Those live **outside the locking core** and never make the core
+itself reach the network. Slice 3 added the first one: `src/git/` (local `git` shell-outs
+under a bounded wait) plus the `start`/`close` COMPOSITION verbs in `src/lifecycle.rs`,
+which orchestrate core primitives + the adapter and hold NO core mutex across a git spawn.
+The core (`src/lock/`) has no dependency on either.
 
 ## Locking safety rules (do not weaken)
 
@@ -78,11 +83,12 @@ outside the locking core** and never make the core itself reach the network.
 
 ## Exit codes & JSON envelope
 
-`0` ok (incl. `release`/`status` of an absent lane). `1` refused
-(`active_held`/`not_owner`/`target_overlap`/`mutex_busy`/`expired`/`not_held`). `2`
-`identity`/`malformed`/`io`/`non_local_root` (plus Clap usage errors, human-only). Under
-`--json`, exactly one versioned envelope is the sole stdout for every post-parse exit path.
-`LaneError::{exit_code,reason}` is the single authoritative mapping (`src/error.rs`).
+`0` ok (incl. `release`/`close`/`status` of an absent lane). `1` refused
+(`active_held`/`not_owner`/`target_overlap`/`mutex_busy`/`expired`/`not_held`/
+`dirty_worktree`). `2` `identity`/`malformed`/`io`/`non_local_root` (plus Clap usage
+errors, human-only). Under `--json`, exactly one versioned envelope is the sole stdout for
+every post-parse exit path. `LaneError::{exit_code,reason}` is the single authoritative
+mapping (`src/error.rs`).
 
 ## Secrets policy
 

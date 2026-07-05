@@ -434,11 +434,8 @@ fn refusal_audit_failure_preserves_the_refusal_code() {
         repo: "ops".into(),
         lane: "demo".into(),
         instance: "b".into(),
-        target: None,
         home: Some(home()),
-        ttl_hours: None,
-        note: None,
-        force: false,
+        ..Default::default()
     };
     let res = claim::claim_core(&root_obj, &params, Utc::now(), &StdFs, &audit);
     let err = res.err().expect("refused");

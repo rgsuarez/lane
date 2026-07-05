@@ -30,6 +30,8 @@ fn main() {
         Command::Release(args) => lane::lock::run_release(&args),
         Command::Status(args) => lane::lock::run_status(&args),
         Command::List(args) => lane::lock::run_list(&args),
+        Command::Start(args) => lane::lifecycle::run_start(&args),
+        Command::Close(args) => lane::lifecycle::run_close(&args),
     };
     std::process::exit(code);
 }

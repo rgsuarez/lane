@@ -37,6 +37,12 @@ pub enum Command {
     Status(StatusArgs),
     /// Read-only listing of claims (all namespaces, or one `--repo`).
     List(ListArgs),
+    /// Create a branch + git worktree and claim the lane with the worktree as its target
+    /// (claim-first; no session is spawned).
+    Start(StartArgs),
+    /// Release an owned lane, optionally removing its git worktree first (never forced;
+    /// a dirty worktree refuses and the claim stays held).
+    Close(CloseArgs),
 }
 
 /// `lane claim <lane> --repo <repo> [--target <abs>] [--ttl-hours <h>] [--note <s>] [--force] [--json]`
@@ -141,6 +147,69 @@ pub struct ListArgs {
     pub json: bool,
     #[arg(long)]
     pub lane_root: Option<PathBuf>,
+}
+
+/// `lane start <lane> --repo <ns> --git-repo <abs> [--branch] [--base] [--worktree]
+/// [--linear-key] [--ttl-hours] [--note] [--json]`. Claim-first composition: read-only
+/// git prechecks, then the claim (target = the worktree path), then branch + worktree
+/// creation; a git failure cleans up (branch deleted, claim released) and reports.
+#[derive(Args, Debug)]
+pub struct StartArgs {
+    /// Lane identifier (Linear key or slug); a single path component.
+    pub lane: String,
+    /// Repo namespace (the lane namespace, not the git repo).
+    #[arg(long)]
+    pub repo: String,
+    /// The git repository to create the branch + worktree in. Absolute path.
+    #[arg(long)]
+    pub git_repo: PathBuf,
+    /// Branch to create (default: the lowercased lane name).
+    #[arg(long)]
+    pub branch: Option<String>,
+    /// Base ref for the new branch (default: HEAD of --git-repo).
+    #[arg(long)]
+    pub base: Option<String>,
+    /// Worktree path to create (default: sibling `<git-repo>-<lowercased-lane>`).
+    /// Absolute path.
+    #[arg(long)]
+    pub worktree: Option<PathBuf>,
+    /// Linear issue key recorded on the claim (informational).
+    #[arg(long)]
+    pub linear_key: Option<String>,
+    /// Lease length in hours (default 12, max 720).
+    #[arg(long)]
+    pub ttl_hours: Option<f64>,
+    /// Free-text note (non-secret; excluded from the audit log).
+    #[arg(long)]
+    pub note: Option<String>,
+    /// Emit the JSON envelope instead of a human line.
+    #[arg(long)]
+    pub json: bool,
+    /// Override `$LANE_ROOT` (else `~/.lane`). Absolute path.
+    #[arg(long)]
+    pub lane_root: Option<PathBuf>,
+    /// Caller identity (required; or `$LANE_INSTANCE`). Never guessed.
+    #[arg(long)]
+    pub instance: Option<String>,
+}
+
+/// `lane close <lane> --repo <ns> [--remove-worktree] [--json]` (owner-only). Without
+/// `--remove-worktree`, close == release. With it: renew first (owner + expiry guard +
+/// lease extension), probe, remove (dirty -> refuse, claim intact), then release.
+#[derive(Args, Debug)]
+pub struct CloseArgs {
+    pub lane: String,
+    #[arg(long)]
+    pub repo: String,
+    /// Also remove the claim's git worktree (never forced; dirty refuses).
+    #[arg(long)]
+    pub remove_worktree: bool,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub lane_root: Option<PathBuf>,
+    #[arg(long)]
+    pub instance: Option<String>,
 }
 
 #[derive(Args, Debug, Default)]
