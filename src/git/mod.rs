@@ -64,6 +64,9 @@ pub enum GitError {
     Timeout { secs: u64 },
     /// The process could not be spawned, or an I/O error occurred while waiting.
     Spawn(io::Error),
+    /// An argument (branch name, base ref, or path) begins with `-` and could be parsed
+    /// by git as a FLAG rather than a value (argv flag smuggling). Refused before spawn.
+    FlagLikeArgument { what: &'static str, value: String },
 }
 
 impl fmt::Display for GitError {
@@ -93,8 +96,27 @@ impl fmt::Display for GitError {
                 write!(f, "git timed out after {secs}s and was killed")
             }
             GitError::Spawn(e) => write!(f, "could not run git: {e}"),
+            GitError::FlagLikeArgument { what, value } => {
+                write!(
+                    f,
+                    "refusing {what} that could be parsed as a git flag: {value}"
+                )
+            }
         }
     }
+}
+
+/// Refuse a value git could parse as a flag (leading `-`), and the empty string. Branch
+/// names, base refs, and paths are handed to git as argv tokens; a value like `--force`
+/// smuggled into any of them would change the command's meaning.
+fn require_flag_safe(what: &'static str, value: &str) -> Result<(), GitError> {
+    if value.is_empty() || value.starts_with('-') {
+        return Err(GitError::FlagLikeArgument {
+            what,
+            value: value.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// The injectable git seam. Callers pass full argument vectors (including `-C <dir>`); the
@@ -227,6 +249,9 @@ impl<'a> GitAdapter<'a> {
     ) -> Result<(), GitError> {
         let repo_s = path_str(repo)?;
         let path_s = path_str(path)?;
+        require_flag_safe("branch name", new_branch)?;
+        require_flag_safe("base ref", base)?;
+        require_flag_safe("worktree path", path_s)?;
         let out = self.runner.run(&[
             "-C", repo_s, "worktree", "add", "-b", new_branch, path_s, base,
         ])?;
@@ -245,6 +270,7 @@ impl<'a> GitAdapter<'a> {
     pub fn worktree_remove(&self, repo: &Path, path: &Path) -> Result<(), GitError> {
         let repo_s = path_str(repo)?;
         let path_s = path_str(path)?;
+        require_flag_safe("worktree path", path_s)?;
         let out = self
             .runner
             .run(&["-C", repo_s, "worktree", "remove", path_s])?;
@@ -264,6 +290,7 @@ impl<'a> GitAdapter<'a> {
     /// `git -C <repo> branch -D <branch>` — compensation-only (start failure cleanup).
     pub fn delete_branch(&self, repo: &Path, branch: &str) -> Result<(), GitError> {
         let repo_s = path_str(repo)?;
+        require_flag_safe("branch name", branch)?;
         let out = self.runner.run(&["-C", repo_s, "branch", "-D", branch])?;
         if out.success() {
             Ok(())
@@ -278,6 +305,7 @@ impl<'a> GitAdapter<'a> {
     /// `git -C <repo> show-ref --verify --quiet refs/heads/<name>` (exit 0 = exists, 1 = not).
     pub fn branch_exists(&self, repo: &Path, name: &str) -> Result<bool, GitError> {
         let repo_s = path_str(repo)?;
+        require_flag_safe("branch name", name)?;
         let refname = format!("refs/heads/{name}");
         let out = self
             .runner
@@ -469,6 +497,53 @@ mod tests {
         assert_eq!(out.stdout, "hello");
         assert_eq!(out.stderr, "oops");
         assert!(!out.success());
+    }
+
+    #[test]
+    fn flag_like_arguments_are_refused_before_spawn() {
+        struct Counting(std::cell::Cell<u32>);
+        impl GitRunner for Counting {
+            fn run(&self, _args: &[&str]) -> Result<GitOutput, GitError> {
+                self.0.set(self.0.get() + 1);
+                Ok(GitOutput {
+                    code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let runner = Counting(std::cell::Cell::new(0));
+        let git = GitAdapter::new(&runner);
+        // A branch or base that looks like a flag must be refused with ZERO spawns.
+        assert!(matches!(
+            git.worktree_add(Path::new("/r"), Path::new("/r-x"), "--force", "HEAD"),
+            Err(GitError::FlagLikeArgument {
+                what: "branch name",
+                ..
+            })
+        ));
+        assert!(matches!(
+            git.worktree_add(Path::new("/r"), Path::new("/r-x"), "b", "--help"),
+            Err(GitError::FlagLikeArgument {
+                what: "base ref",
+                ..
+            })
+        ));
+        assert!(matches!(
+            git.delete_branch(Path::new("/r"), "-D"),
+            Err(GitError::FlagLikeArgument {
+                what: "branch name",
+                ..
+            })
+        ));
+        assert!(matches!(
+            git.branch_exists(Path::new("/r"), "--verify"),
+            Err(GitError::FlagLikeArgument {
+                what: "branch name",
+                ..
+            })
+        ));
+        assert_eq!(runner.0.get(), 0, "no git spawn for a refused argument");
     }
 
     #[test]
