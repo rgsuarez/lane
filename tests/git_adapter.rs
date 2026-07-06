@@ -199,6 +199,37 @@ fn cross_device_warning_none_on_nonexistent_leaf_under_home() {
     );
 }
 
+#[test]
+fn two_step_branch_then_worktree_round_trips() {
+    let root = temp_root();
+    let repo = root.path().join("repo");
+    init_scratch_repo(&repo);
+    let wt = root.path().join("repo-lane");
+    let runner = StdGitRunner::new();
+    let git = GitAdapter::new(&runner);
+
+    git.check_branch_name(&repo, "two-step")
+        .expect("valid name");
+    assert!(matches!(
+        git.check_branch_name(&repo, "bad..name"),
+        Err(GitError::Plumbing { .. })
+    ));
+
+    git.create_branch(&repo, "two-step", "HEAD")
+        .expect("branch created");
+    assert!(git.branch_exists(&repo, "two-step").unwrap());
+    git.worktree_add_existing(&repo, &wt, "two-step")
+        .expect("worktree attaches to the existing branch");
+    let probed = git.probe_worktree(&wt).unwrap().expect("live");
+    assert_eq!(probed.branch.as_deref(), Some("two-step"));
+
+    // A second create of the same name fails (the exactly-once ownership signal).
+    assert!(matches!(
+        git.create_branch(&repo, "two-step", "HEAD"),
+        Err(GitError::Plumbing { .. })
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // Fake-seam fault paths (no real git).
 // ---------------------------------------------------------------------------

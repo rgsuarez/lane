@@ -109,9 +109,11 @@ pub(crate) fn run_start_at(args: &StartArgs, now: DateTime<Utc>, runner: &dyn Gi
         let base = args.base.clone().unwrap_or_else(|| "HEAD".to_string());
 
         // Step 0 — read-only git prechecks BEFORE the claim (typo-class failures never
-        // reach the audit log). The branch is verified ABSENT here, which is what makes
-        // the failure-path branch cleanup safe (we only delete what this run created).
+        // reach the audit log). The branch name is validated the way git itself does
+        // (check-ref-format), so an invalid override fails here with a clear error.
         let git = GitAdapter::new(runner);
+        git.check_branch_name(git_repo, &branch)
+            .map_err(git_to_lane)?;
         let precheck = git
             .precheck_start(git_repo, &worktree, &branch, home.as_deref())
             .map_err(git_to_lane)?;
@@ -137,8 +139,19 @@ pub(crate) fn run_start_at(args: &StartArgs, now: DateTime<Utc>, runner: &dyn Gi
         let claim = claim_core(&root, &params, now, &fs, &sink)?;
 
         // Step 2 — git mutations UNDER the claim (no core mutex is held here; claim_core
-        // has returned). Git receives the derived on-disk path, never target_normalized.
-        if let Err(git_err) = git.worktree_add(git_repo, &worktree, &branch, &base) {
+        // has returned). TWO OWNED STEPS, not `worktree add -b`: branch creation is its
+        // own tracked call, so the compensation path knows AS A FACT whether this run
+        // created the branch — it never infers creation from a later branch_exists,
+        // which would race an external git process creating the same name and could
+        // delete a branch that was never ours. Git receives the derived on-disk path,
+        // never target_normalized.
+        let mut branch_created = false;
+        let git_result: Result<(), GitError> = (|| {
+            git.create_branch(git_repo, &branch, &base)?;
+            branch_created = true;
+            git.worktree_add_existing(git_repo, &worktree, &branch)
+        })();
+        if let Err(git_err) = git_result {
             let warning = compensate_start_failure(
                 &root,
                 &args.repo,
@@ -147,6 +160,7 @@ pub(crate) fn run_start_at(args: &StartArgs, now: DateTime<Utc>, runner: &dyn Gi
                 git_repo,
                 &branch,
                 &worktree,
+                branch_created,
                 &git,
                 &fs,
                 &sink,
@@ -179,8 +193,9 @@ pub(crate) fn run_start_at(args: &StartArgs, now: DateTime<Utc>, runner: &dyn Gi
 
 /// The `start` failure path: compensating cleanup, then release, all faults REPORTED and
 /// none escalated (the git failure that got us here stays the primary error). The branch
-/// was verified ABSENT in the precheck, so a branch present now was created by this run's
-/// failed `worktree add` and is deleted so a retry is never blocked; a leftover partial
+/// is deleted IF AND ONLY IF this run's own `create_branch` succeeded (`branch_created`,
+/// a tracked fact — never an existence probe, which would race an external git process
+/// creating the same name and delete a branch that was never ours). A leftover partial
 /// worktree directory is named; the claim is released through the write-ahead-audited
 /// core primitive, and if THAT fails the still-held claim is named explicitly (safe
 /// direction: TTL-bounded, board-visible, releasable).
@@ -193,6 +208,7 @@ fn compensate_start_failure(
     git_repo: &Path,
     branch: &str,
     worktree: &Path,
+    branch_created: bool,
     git: &GitAdapter<'_>,
     fs: &dyn crate::lock::FsOps,
     sink: &dyn crate::lock::audit::AuditSink,
@@ -200,18 +216,12 @@ fn compensate_start_failure(
     now: DateTime<Utc>,
 ) -> Option<String> {
     let mut warnings: Vec<Option<String>> = vec![claim_warning];
-    match git.branch_exists(git_repo, branch) {
-        Ok(true) => {
-            if let Err(e) = git.delete_branch(git_repo, branch) {
-                warnings.push(Some(format!(
-                    "cleanup: could not delete branch {branch}: {e}"
-                )));
-            }
+    if branch_created {
+        if let Err(e) = git.delete_branch(git_repo, branch) {
+            warnings.push(Some(format!(
+                "cleanup: could not delete branch {branch}: {e}"
+            )));
         }
-        Ok(false) => {}
-        Err(e) => warnings.push(Some(format!(
-            "cleanup: could not check branch {branch}: {e}"
-        ))),
     }
     if worktree.exists() {
         warnings.push(Some(format!(
@@ -274,40 +284,114 @@ pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, runner: &dyn Gi
 
         if args.remove_worktree {
             // Step 1 — RENEW FIRST: enforces owner + expiry (a lapsed lease is not yours
-            // to tear down) AND extends the lease a full TTL, so the claim cannot lapse
-            // into expiry-takeover while git runs. After this, only a deliberate
-            // `claim --force` can change ownership mid-close.
+            // to tear down) AND extends the lease by the claim's own TTL, so the claim
+            // cannot lapse into expiry-takeover while git runs. A NotHeld here means the
+            // claim vanished between the step-0 read and the renew (a release race):
+            // map it to the same harmless not_held exit-0 contract as step 0.
             let renew = RenewParams {
                 repo: args.repo.clone(),
                 lane: args.lane.clone(),
                 instance: instance.clone(),
                 ttl_hours: None,
             };
-            let renewed = renew_core(&root, &renew, now, &fs, &sink)?;
+            let renewed = match renew_core(&root, &renew, now, &fs, &sink) {
+                Ok(s) => s,
+                Err(LaneError::Refused(RefusedReason::NotHeld)) => {
+                    let data = VerbData::Close {
+                        lane: args.lane.clone(),
+                        released: false,
+                        worktree_removed: false,
+                        skipped_missing_worktree: false,
+                    };
+                    return Ok((Outcome::NotHeld, Some(data), join_warnings(warnings)));
+                }
+                Err(e) => return Err(e.into()),
+            };
             warnings.push(renewed.audit_warning);
+            // From here on, every failure path must CARRY the accumulated warnings (the
+            // renew may have succeeded with audit degradation; hiding that in a later
+            // git-error envelope would misreport the completed lease extension).
+            let fail = |e: crate::git::GitError, warnings: Vec<Option<String>>| CommandError {
+                error: git_to_lane(e),
+                audit_warning: join_warnings(warnings),
+            };
 
             // Step 2 — probe, then remove (no core mutex held across these spawns).
             let stored = rec.target_normalized.clone().or_else(|| rec.target.clone());
-            match stored {
-                None => {
-                    // A target-less coordination claim: nothing to remove.
-                    skipped_missing = false;
+            if let Some(t) = stored {
+                let git = GitAdapter::new(runner);
+                // Resolve the path to REMOVE: the stored (case-folded) target directly;
+                // on a miss, the same real-case fallback the board provider uses, so an
+                // operator-overridden mixed-case worktree on a case-sensitive volume is
+                // still found (never released-but-left-behind). Ambiguity never guesses.
+                let stored_path = Path::new(&t).to_path_buf();
+                let mut remove_path: Option<std::path::PathBuf> = None;
+                match git.probe_worktree(&stored_path) {
+                    Err(e) => return Err(fail(e, warnings)),
+                    Ok(Some(_)) => remove_path = Some(stored_path.clone()),
+                    Ok(None) => {
+                        if let (Some(parent), Some(tail)) =
+                            (stored_path.parent(), stored_path.file_name())
+                        {
+                            let tail = tail.to_string_lossy().to_string();
+                            let entries: Vec<String> = std::fs::read_dir(parent)
+                                .map(|rd| {
+                                    rd.filter_map(|e| e.ok())
+                                        .map(|e| e.file_name().to_string_lossy().to_string())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            match crate::board::worktrees::resolve_real_case(&entries, &tail) {
+                                crate::board::worktrees::CaseMatch::One(real) if real != tail => {
+                                    let real_path = parent.join(real);
+                                    match git.probe_worktree(&real_path) {
+                                        Err(e) => return Err(fail(e, warnings)),
+                                        Ok(Some(_)) => remove_path = Some(real_path),
+                                        Ok(None) => {}
+                                    }
+                                }
+                                crate::board::worktrees::CaseMatch::Ambiguous => {
+                                    warnings.push(Some(format!(
+                                        "worktree removal skipped: ambiguous case-insensitive matches for {} (never guessed)",
+                                        stored_path.display()
+                                    )));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
-                Some(t) => {
-                    let wt = Path::new(&t);
-                    let git = GitAdapter::new(runner);
-                    match git.probe_worktree(wt).map_err(git_to_lane)? {
-                        None => {
-                            // Already deleted, or not a worktree: skip the git spawn and
-                            // fall through to release — a claim must never become
-                            // un-closable over a directory that no longer exists.
-                            skipped_missing = true;
+                match remove_path {
+                    None => {
+                        // Already deleted, or not a worktree: skip the git spawn and
+                        // fall through to release — a claim must never become
+                        // un-closable over a directory that no longer exists.
+                        skipped_missing = true;
+                    }
+                    Some(wt) => {
+                        // Defense-in-depth ownership RE-VERIFY immediately before the
+                        // destructive spawn: the renew extended the lease, so only a
+                        // deliberate `claim --force` can have changed ownership — but a
+                        // forced takeover mid-close must not have its fresh worktree
+                        // destroyed by the prior owner. A guarded read costs one stat.
+                        match record::read_claim(&lock_path, root.path(), root.expected_uid(), &fs)
+                        {
+                            Ok(Some(cur)) if cur.instance == instance => {}
+                            _ => {
+                                return Err(CommandError {
+                                    error: LaneError::Refused(RefusedReason::NotOwner),
+                                    audit_warning: join_warnings(warnings),
+                                });
+                            }
                         }
-                        Some(_) => {
-                            let main_repo = git.main_repo_of(wt).map_err(git_to_lane)?;
-                            git.worktree_remove(&main_repo, wt).map_err(git_to_lane)?;
-                            worktree_removed = true;
+                        let main_repo = match git.main_repo_of(&wt) {
+                            Ok(p) => p,
+                            Err(e) => return Err(fail(e, warnings)),
+                        };
+                        if let Err(e) = git.worktree_remove(&main_repo, &wt) {
+                            return Err(fail(e, warnings));
                         }
+                        worktree_removed = true;
                     }
                 }
             }
@@ -444,6 +528,7 @@ mod tests {
             Path::new("/repo"),
             "demo-branch",
             Path::new("/repo-demo-nonexistent"),
+            true,
             &git,
             &StdFs,
             &sink,
@@ -491,6 +576,7 @@ mod tests {
             Path::new("/repo"),
             "demo-branch",
             Path::new("/repo-demo-nonexistent"),
+            true,
             &git,
             &StdFs,
             &sink,
@@ -509,6 +595,51 @@ mod tests {
         assert!(
             root.lock_path("ops", "demo").exists(),
             "the claim survives the failed release (TTL-bounded, releasable)"
+        );
+    }
+
+    #[test]
+    fn compensation_never_deletes_a_branch_this_run_did_not_create() {
+        // THE RACE PIN: an external git process created the same branch name after our
+        // precheck; our create_branch therefore failed (branch_created=false). The
+        // compensation must NOT delete that foreign branch, no matter what an existence
+        // probe would say.
+        let home = std::env::var("HOME").unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("lane-lc-")
+            .tempdir_in(&home)
+            .unwrap();
+        let (root, sink) = setup(tmp.path());
+        claim_demo(&root, &sink);
+
+        let runner = CompensationGit {
+            log: std::cell::RefCell::new(Vec::new()),
+            fail_delete: false,
+        };
+        let git = GitAdapter::new(&runner);
+        let _ = compensate_start_failure(
+            &root,
+            "ops",
+            "demo",
+            "a",
+            Path::new("/repo"),
+            "demo-branch",
+            Path::new("/repo-demo-nonexistent"),
+            false, // this run did NOT create the branch
+            &git,
+            &StdFs,
+            &sink,
+            None,
+            Utc::now(),
+        );
+        let log = runner.log.borrow().join("\n");
+        assert!(
+            !log.contains("branch -D"),
+            "a branch this run did not create is NEVER deleted, log: {log}"
+        );
+        assert!(
+            !root.lock_path("ops", "demo").exists(),
+            "the claim is still compensating-released"
         );
     }
 
@@ -535,6 +666,7 @@ mod tests {
             Path::new("/repo"),
             "demo-branch",
             Path::new("/repo-demo-nonexistent"),
+            true,
             &git,
             &StdFs,
             &sink,

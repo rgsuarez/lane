@@ -152,6 +152,9 @@ impl Default for StdGitRunner {
 impl GitRunner for StdGitRunner {
     fn run(&self, args: &[&str]) -> Result<GitOutput, GitError> {
         let mut cmd = Command::new("git");
+        // Pin a stable locale: the dirty-refusal detector (and any stderr matching)
+        // parses git's message text, which is localized under a non-English LANG.
+        cmd.env("LC_ALL", "C");
         cmd.args(args);
         run_bounded(cmd, self.timeout)
     }
@@ -192,6 +195,10 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<GitOutput, GitErro
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Joining after the kill relies on the pipes closing with the child;
+                    // a grandchild holding an inherited pipe could delay this, which is
+                    // pathological for git's own subprocesses and accepted as out of
+                    // threat-model (git spawns no long-lived detached children).
                     let _ = out_handle.join();
                     let _ = err_handle.join();
                     return Err(GitError::Timeout {
@@ -201,7 +208,13 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<GitOutput, GitErro
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(Duration::from_millis(50));
             }
-            Err(e) => return Err(GitError::Spawn(e)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_handle.join();
+                let _ = err_handle.join();
+                return Err(GitError::Spawn(e));
+            }
         }
     };
     let stdout = out_handle.join().unwrap_or_default();
@@ -239,7 +252,73 @@ impl<'a> GitAdapter<'a> {
         Self { runner }
     }
 
-    /// `git -C <repo> worktree add -b <branch> <path> <base>`.
+    /// `git -C <repo> check-ref-format --branch <name>` — validates a branch name the
+    /// way git itself does (rejects `..`, `~`, spaces, control chars, and every other
+    /// invalid-refname shape the leading-dash guard cannot catch).
+    pub fn check_branch_name(&self, repo: &Path, name: &str) -> Result<(), GitError> {
+        let repo_s = path_str(repo)?;
+        require_flag_safe("branch name", name)?;
+        let out = self
+            .runner
+            .run(&["-C", repo_s, "check-ref-format", "--branch", name])?;
+        if out.success() {
+            Ok(())
+        } else {
+            Err(GitError::Plumbing {
+                code: out.code,
+                stderr: format!("invalid branch name {name:?}: {}", out.stderr.trim()),
+            })
+        }
+    }
+
+    /// `git -C <repo> branch <name> <base>` — create the branch as its OWN tracked step.
+    /// `start` uses this (instead of `worktree add -b`) so branch OWNERSHIP is a known
+    /// fact: the compensation path deletes the branch if and only if THIS call
+    /// succeeded, never by inferring creation from a later `branch_exists` (which races
+    /// an external git process creating the same name).
+    pub fn create_branch(&self, repo: &Path, name: &str, base: &str) -> Result<(), GitError> {
+        let repo_s = path_str(repo)?;
+        require_flag_safe("branch name", name)?;
+        require_flag_safe("base ref", base)?;
+        let out = self.runner.run(&["-C", repo_s, "branch", name, base])?;
+        if out.success() {
+            Ok(())
+        } else {
+            Err(GitError::Plumbing {
+                code: out.code,
+                stderr: out.stderr,
+            })
+        }
+    }
+
+    /// `git -C <repo> worktree add <path> <branch>` — attach a worktree to an EXISTING
+    /// branch (created by [`Self::create_branch`]).
+    pub fn worktree_add_existing(
+        &self,
+        repo: &Path,
+        path: &Path,
+        branch: &str,
+    ) -> Result<(), GitError> {
+        let repo_s = path_str(repo)?;
+        let path_s = path_str(path)?;
+        require_flag_safe("branch name", branch)?;
+        require_flag_safe("worktree path", path_s)?;
+        let out = self
+            .runner
+            .run(&["-C", repo_s, "worktree", "add", path_s, branch])?;
+        if out.success() {
+            Ok(())
+        } else {
+            Err(GitError::Plumbing {
+                code: out.code,
+                stderr: out.stderr,
+            })
+        }
+    }
+
+    /// `git -C <repo> worktree add -b <branch> <path> <base>` (single-step form; the
+    /// lifecycle layer prefers the two-step create_branch + worktree_add_existing for
+    /// compensation-ownership reasons — see [`Self::create_branch`]).
     pub fn worktree_add(
         &self,
         repo: &Path,
@@ -475,11 +554,15 @@ pub fn cross_device_warning(path: &Path, home: Option<&str>) -> Option<String> {
     }
 }
 
-/// The device id of `path`'s longest existing ancestor (walking up until a component exists).
+/// The device id of `path`'s longest existing ancestor (walking up until a component
+/// exists). Uses FOLLOWING metadata deliberately: a symlinked ancestor (for example a
+/// local `~/projects` symlink onto an NFS volume) must report the device the path
+/// actually RESOLVES to — the exact case the cross-device warning exists for — not the
+/// symlink's own local device.
 fn device_of_longest_existing_ancestor(path: &Path) -> io::Result<u64> {
     let mut acc = path.to_path_buf();
     loop {
-        match std::fs::symlink_metadata(&acc) {
+        match std::fs::metadata(&acc) {
             Ok(m) => return Ok(m.dev()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 if !acc.pop() {

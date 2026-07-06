@@ -31,7 +31,7 @@ impl WorktreeProvider for EmptyWorktreeProvider {
             provenance: Provenance::Derived,
             ok: true,
             fetched_at: now,
-            note: "no worktree provider (Slice 1; real `git worktree list` deferred)".to_string(),
+            note: "worktrees off (the offline default; opt in with --worktrees git)".to_string(),
         }
     }
 }

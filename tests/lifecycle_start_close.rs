@@ -196,6 +196,31 @@ fn start_precheck_failures_exit_2_before_any_claim() {
 }
 
 #[test]
+fn start_rejects_an_invalid_branch_name_before_any_claim() {
+    let root = temp_root();
+    let r = root.path();
+    let area = scratch_area();
+    let repo = scratch_repo(area.path());
+    let repo_s = repo.to_str().unwrap();
+
+    // check-ref-format catches shapes the leading-dash guard cannot (.., ~, spaces).
+    let out = run(
+        r,
+        Some("a"),
+        &start_args(repo_s, &["--branch", "bad..name"]),
+    );
+    assert_eq!(code(&out), 2, "an invalid refname is refused");
+    assert!(
+        read_lock(r, "ops", "LQOS-9").is_none(),
+        "no claim on an invalid branch name"
+    );
+    assert!(
+        !r.join("ops").join("audit.log").exists(),
+        "refused before the claim, so no audit churn"
+    );
+}
+
+#[test]
 fn close_plain_releases_without_touching_the_worktree() {
     let root = temp_root();
     let r = root.path();
