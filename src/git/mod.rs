@@ -430,18 +430,22 @@ impl<'a> GitAdapter<'a> {
             .runner
             .run(&["-C", path_s, "rev-parse", "--is-inside-work-tree"])?;
         if !(inside.success() && inside.stdout.trim() == "true") {
-            // A MISS (Ok(None)) is only the two benign shapes: the path is gone
-            // ("cannot change to"), or it is a plain directory under no repository
-            // ("not a git repository"). An INSPECTION failure on something that may
-            // well be a real worktree — dubious ownership, permission denied, a
-            // corrupt object store — must PROPAGATE so a destructive caller (close)
-            // fails closed instead of releasing a claim over a surviving worktree.
-            // LC_ALL=C is pinned by the runner, so the message text is stable.
+            // A MISS (Ok(None)) is only the two benign shapes: the path is GONE
+            // ("cannot change to ... no such file or directory" - the ENOENT form
+            // ONLY; the same prefix with "permission denied" means an inaccessible
+            // path that may still hold a real worktree), or a plain directory under
+            // no repository ("not a git repository"). An INSPECTION failure -
+            // dubious ownership, permission denied, a corrupt object store - must
+            // PROPAGATE so a destructive caller (close) fails closed instead of
+            // releasing a claim over a surviving worktree. LC_ALL=C is pinned by
+            // the runner, so the message text is stable.
             if inside.success() {
                 return Ok(None); // printed something other than "true": not a work tree
             }
             let s = inside.stderr.to_ascii_lowercase();
-            let benign_miss = s.contains("cannot change to") || s.contains("not a git repository");
+            let benign_miss = (s.contains("cannot change to")
+                && s.contains("no such file or directory"))
+                || s.contains("not a git repository");
             if benign_miss {
                 return Ok(None);
             }
@@ -737,6 +741,7 @@ mod tests {
         for stderr in [
             "fatal: detected dubious ownership in repository at '/x'",
             "fatal: cannot open '/x/.git': Permission denied",
+            "fatal: cannot change to '/x': Permission denied",
         ] {
             let r = Scripted(stderr, Some(128));
             let git = GitAdapter::new(&r);
