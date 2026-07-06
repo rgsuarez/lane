@@ -356,10 +356,10 @@ pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, runner: &dyn Gi
                 // operator-overridden mixed-case worktree on a case-sensitive volume is
                 // still found (never released-but-left-behind). Ambiguity never guesses.
                 let stored_path = Path::new(&t).to_path_buf();
-                let mut remove_path: Option<std::path::PathBuf> = None;
+                let mut remove_path: Option<(std::path::PathBuf, Option<String>)> = None;
                 match git.probe_worktree(&stored_path) {
                     Err(e) => return Err(fail(e, warnings)),
-                    Ok(Some(_)) => remove_path = Some(stored_path.clone()),
+                    Ok(Some(info)) => remove_path = Some((stored_path.clone(), info.branch)),
                     Ok(None) => {
                         if let (Some(parent), Some(tail)) =
                             (stored_path.parent(), stored_path.file_name())
@@ -387,7 +387,9 @@ pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, runner: &dyn Gi
                                     let real_path = parent.join(real);
                                     match git.probe_worktree(&real_path) {
                                         Err(e) => return Err(fail(e, warnings)),
-                                        Ok(Some(_)) => remove_path = Some(real_path),
+                                        Ok(Some(info)) => {
+                                            remove_path = Some((real_path, info.branch))
+                                        }
                                         Ok(None) => {}
                                     }
                                 }
@@ -416,7 +418,30 @@ pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, runner: &dyn Gi
                         // un-closable over a directory that no longer exists.
                         skipped_missing = true;
                     }
-                    Some(wt) => {
+                    Some((wt, probed_branch)) => {
+                        // Worktree IDENTITY guard: when the claim records the branch its
+                        // lifecycle created, the entity about to be removed must be ON
+                        // that branch. The stored target is case-folded, so an UNRELATED
+                        // worktree can resolve at that path (a folded-case collision on a
+                        // case-sensitive volume, or manual surgery replacing the worktree
+                        // between start and close); git refuses one branch on two
+                        // worktrees, so a branch match proves the worktree is this
+                        // claim's. Mismatch fails closed: worktree kept, claim kept (and
+                        // renewed). A branchless claim records no identity to prove and
+                        // keeps path-identity semantics.
+                        if let Some(expected) = rec.branch.as_deref() {
+                            if probed_branch.as_deref() != Some(expected) {
+                                return Err(CommandError {
+                                    error: LaneError::Identity(format!(
+                                        "worktree at {} is on branch '{}', not the claim's branch '{}'; refusing to remove (claim kept)",
+                                        wt.display(),
+                                        probed_branch.as_deref().unwrap_or("<detached>"),
+                                        expected
+                                    )),
+                                    audit_warning: join_warnings(warnings),
+                                });
+                            }
+                        }
                         // Defense-in-depth ownership RE-VERIFY immediately before the
                         // destructive spawn: the renew extended the lease, so only a
                         // deliberate `claim --force` can have changed ownership — but a

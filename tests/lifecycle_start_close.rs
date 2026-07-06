@@ -281,6 +281,109 @@ fn close_remove_worktree_happy_removes_and_releases() {
 }
 
 #[test]
+fn close_refuses_to_remove_a_worktree_that_is_not_on_the_claims_branch() {
+    let root = temp_root();
+    let r = root.path();
+    let area = scratch_area();
+    let repo = scratch_repo(area.path());
+    let repo_s = repo.to_str().unwrap();
+    assert_eq!(code(&run(r, Some("a"), &start_args(repo_s, &[]))), 0);
+    let wt = format!("{repo_s}-lqos-9");
+
+    // Replace the lifecycle worktree with an IMPOSTOR at the same path on a different
+    // branch — the shape a case-folded stored target can resolve to on a case-sensitive
+    // volume, and what manual surgery between start and close produces anywhere.
+    let rm = std::process::Command::new("git")
+        .args(["-C", repo_s, "worktree", "remove", &wt])
+        .output()
+        .unwrap();
+    assert!(rm.status.success(), "setup: remove the real worktree");
+    let add = std::process::Command::new("git")
+        .args(["-C", repo_s, "worktree", "add", "-b", "impostor", &wt])
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "setup: impostor worktree at the target"
+    );
+
+    let out = run(
+        r,
+        Some("a"),
+        &[
+            "close",
+            "LQOS-9",
+            "--repo",
+            "ops",
+            "--remove-worktree",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        code(&out),
+        2,
+        "a branch mismatch is an identity failure, not a refusal: stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::path::Path::new(&wt).is_dir(),
+        "the impostor worktree is never removed"
+    );
+    assert!(
+        read_lock(r, "ops", "LQOS-9").is_some(),
+        "claim kept: releasing would drop protection over an unresolved target"
+    );
+}
+
+#[test]
+fn close_remove_worktree_on_a_branchless_claim_keeps_path_identity_semantics() {
+    let root = temp_root();
+    let r = root.path();
+    let area = scratch_area();
+    let repo = scratch_repo(area.path());
+    let repo_s = repo.to_str().unwrap();
+
+    // A worktree made OUTSIDE the lifecycle (no `start`), claimed as a bare target: the
+    // claim records no branch, so close has no identity to prove and removes by path.
+    let wt = format!("{repo_s}-manual");
+    let add = std::process::Command::new("git")
+        .args(["-C", repo_s, "worktree", "add", "-b", "manual", &wt])
+        .output()
+        .unwrap();
+    assert!(add.status.success());
+    assert_eq!(
+        code(&run(
+            r,
+            Some("a"),
+            &["claim", "manual", "--repo", "ops", "--target", &wt, "--json"]
+        )),
+        0
+    );
+
+    let out = run(
+        r,
+        Some("a"),
+        &[
+            "close",
+            "manual",
+            "--repo",
+            "ops",
+            "--remove-worktree",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        code(&out),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout_json(&out)["data"]["worktree_removed"], true);
+    assert!(!std::path::Path::new(&wt).exists(), "worktree removed");
+    assert!(read_lock(r, "ops", "manual").is_none(), "claim released");
+}
+
+#[test]
 fn close_dirty_worktree_refuses_with_claim_intact_and_lease_extended() {
     let root = temp_root();
     let r = root.path();
