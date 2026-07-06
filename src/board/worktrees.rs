@@ -76,31 +76,7 @@ impl WorktreeProvider for FixtureWorktreeProvider {
     }
 }
 
-/// The outcome of matching a case-folded stored tail against real directory entries.
-#[derive(Debug, PartialEq, Eq)]
-pub enum CaseMatch {
-    /// Exactly one entry matches case-insensitively: the real on-disk name.
-    One(String),
-    /// No entry matches: the worktree genuinely is not there.
-    Absent,
-    /// Two or more entries differ only by case (possible on a case-sensitive volume):
-    /// never guess — skip the claim and degrade the source.
-    Ambiguous,
-}
-
-/// Case-insensitively match a stored (ASCII-folded) leaf name against real entries.
-/// Pure logic, unit-tested directly: the ambiguous branch is only REACHABLE on a
-/// case-sensitive filesystem, which the dev machine's default volume is not.
-pub fn resolve_real_case(entries: &[String], folded_tail: &str) -> CaseMatch {
-    let mut hits = entries
-        .iter()
-        .filter(|e| e.eq_ignore_ascii_case(folded_tail));
-    match (hits.next(), hits.next()) {
-        (None, _) => CaseMatch::Absent,
-        (Some(one), None) => CaseMatch::One(one.clone()),
-        (Some(_), Some(_)) => CaseMatch::Ambiguous,
-    }
-}
+pub use crate::git::{resolve_real_case, CaseMatch};
 
 /// The Slice-3 LIVE provider (`--worktrees git`): probes each TARGETED claim's stored
 /// path with stable git plumbing. Guarantees: `target=None` claims spawn NOTHING; every
@@ -150,22 +126,31 @@ impl<'a> GitWorktreeProvider<'a> {
         ok
     }
 
-    fn probe(&self, path: &Path) -> Option<WorktreeInfo> {
+    fn probe(&self, path: &Path) -> ProbeOutcome {
         self.probes.set(self.probes.get() + 1);
         match self.git.probe_worktree(path) {
-            Ok(Some(wt)) => Some(WorktreeInfo {
+            Ok(Some(wt)) => ProbeOutcome::Live(WorktreeInfo {
                 path: wt.path.to_string_lossy().to_string(),
                 branch: wt.branch,
                 head: wt.head,
             }),
-            Ok(None) => None,
+            Ok(None) => ProbeOutcome::Miss,
             Err(e) => {
                 self.degraded.set(true);
                 self.note(format!("probe failed for {}: {e}", path.display()));
-                None
+                ProbeOutcome::Errored
             }
         }
     }
+}
+
+/// Per-call probe result: the fallback decision keys off THIS call's outcome, never the
+/// provider's accumulated degradation (an earlier claim's timeout must not suppress a
+/// later claim's real-case fallback; degradation still lands in source freshness).
+enum ProbeOutcome {
+    Live(WorktreeInfo),
+    Miss,
+    Errored,
 }
 
 impl WorktreeProvider for GitWorktreeProvider<'_> {
@@ -181,12 +166,12 @@ impl WorktreeProvider for GitWorktreeProvider<'_> {
         let stored_path = Path::new(stored);
 
         // Direct probe: default derivations store a lowercased leaf, so stored == on-disk.
-        if let Some(info) = self.probe(stored_path) {
-            return Some(Provenanced::derived(info));
-        }
-        if self.degraded.get() {
-            // The direct probe errored (not merely missed); do not double-probe.
-            return None;
+        // The fallback decision keys off THIS probe's outcome (per-call), never the
+        // provider's global degradation state.
+        match self.probe(stored_path) {
+            ProbeOutcome::Live(info) => return Some(Provenanced::derived(info)),
+            ProbeOutcome::Errored => return None, // this call errored; no double-probe
+            ProbeOutcome::Miss => {}
         }
 
         // Fallback for operator-overridden real-case paths: readdir the existing parent
@@ -207,7 +192,10 @@ impl WorktreeProvider for GitWorktreeProvider<'_> {
                     return None;
                 }
                 let real_path = parent.join(real);
-                self.probe(&real_path).map(Provenanced::derived)
+                match self.probe(&real_path) {
+                    ProbeOutcome::Live(info) => Some(Provenanced::derived(info)),
+                    ProbeOutcome::Miss | ProbeOutcome::Errored => None,
+                }
             }
             CaseMatch::Absent => None,
             CaseMatch::Ambiguous => {

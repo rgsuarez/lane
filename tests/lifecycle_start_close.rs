@@ -412,6 +412,48 @@ fn close_remove_worktree_is_owner_only_and_expiry_refusing() {
 }
 
 #[test]
+fn forced_takeover_blocks_the_prior_owners_destructive_close() {
+    let root = temp_root();
+    let r = root.path();
+    let area = scratch_area();
+    let repo = scratch_repo(area.path());
+    let repo_s = repo.to_str().unwrap();
+    assert_eq!(code(&run(r, Some("a"), &start_args(repo_s, &[]))), 0);
+    let wt = format!("{repo_s}-lqos-9");
+
+    // A deliberate forced takeover moves ownership to another instance.
+    assert_eq!(
+        code(&run(
+            r,
+            Some("b"),
+            &["claim", "LQOS-9", "--repo", "ops", "--force", "--json"]
+        )),
+        0
+    );
+
+    // The prior owner's destructive close is refused at the owner gate and the
+    // (now the new owner's) worktree survives untouched.
+    let out = run(
+        r,
+        Some("a"),
+        &[
+            "close",
+            "LQOS-9",
+            "--repo",
+            "ops",
+            "--remove-worktree",
+            "--json",
+        ],
+    );
+    assert_eq!(code(&out), 1);
+    assert_eq!(stdout_json(&out)["reason"], "not_owner");
+    assert!(
+        std::path::Path::new(&wt).is_dir(),
+        "the new owner's worktree is never destroyed by the prior owner"
+    );
+}
+
+#[test]
 fn close_skips_an_already_deleted_worktree_and_releases() {
     let root = temp_root();
     let r = root.path();

@@ -216,6 +216,17 @@ fn compensate_start_failure(
     now: DateTime<Utc>,
 ) -> Option<String> {
     let mut warnings: Vec<Option<String>> = vec![claim_warning];
+    // Remove any partially-registered worktree FIRST: a worktree that git managed to
+    // register before failing keeps its branch checked out, which would make the branch
+    // delete below fail. Order matters; every fault is reported, none escalates.
+    if worktree.exists() {
+        if let Err(e) = git.worktree_remove(git_repo, worktree) {
+            warnings.push(Some(format!(
+                "cleanup: could not remove partial worktree {}: {e}",
+                worktree.display()
+            )));
+        }
+    }
     if branch_created {
         if let Err(e) = git.delete_branch(git_repo, branch) {
             warnings.push(Some(format!(
@@ -334,15 +345,25 @@ pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, runner: &dyn Gi
                             (stored_path.parent(), stored_path.file_name())
                         {
                             let tail = tail.to_string_lossy().to_string();
-                            let entries: Vec<String> = std::fs::read_dir(parent)
-                                .map(|rd| {
-                                    rd.filter_map(|e| e.ok())
-                                        .map(|e| e.file_name().to_string_lossy().to_string())
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            match crate::board::worktrees::resolve_real_case(&entries, &tail) {
-                                crate::board::worktrees::CaseMatch::One(real) if real != tail => {
+                            // A readdir FAILURE must not read as "worktree missing": a
+                            // permission or io fault here would otherwise release the
+                            // claim while the worktree survives unprotected. Only a
+                            // clean NotFound (parent gone) counts as genuinely absent.
+                            let entries: Vec<String> = match std::fs::read_dir(parent) {
+                                Ok(rd) => rd
+                                    .filter_map(|e| e.ok())
+                                    .map(|e| e.file_name().to_string_lossy().to_string())
+                                    .collect(),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                                Err(e) => {
+                                    return Err(CommandError {
+                                        error: LaneError::Io(e),
+                                        audit_warning: join_warnings(warnings),
+                                    });
+                                }
+                            };
+                            match crate::git::resolve_real_case(&entries, &tail) {
+                                crate::git::CaseMatch::One(real) if real != tail => {
                                     let real_path = parent.join(real);
                                     match git.probe_worktree(&real_path) {
                                         Err(e) => return Err(fail(e, warnings)),
@@ -350,11 +371,18 @@ pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, runner: &dyn Gi
                                         Ok(None) => {}
                                     }
                                 }
-                                crate::board::worktrees::CaseMatch::Ambiguous => {
-                                    warnings.push(Some(format!(
-                                        "worktree removal skipped: ambiguous case-insensitive matches for {} (never guessed)",
-                                        stored_path.display()
-                                    )));
+                                crate::git::CaseMatch::Ambiguous => {
+                                    // FAIL CLOSED: releasing here would drop protection
+                                    // while an unidentified worktree survives on disk.
+                                    // The operator resolves the case-ambiguous pair
+                                    // manually; the claim stays held (and renewed).
+                                    return Err(CommandError {
+                                        error: LaneError::Identity(format!(
+                                            "ambiguous case-insensitive worktree matches for {}; resolve manually (claim kept)",
+                                            stored_path.display()
+                                        )),
+                                        audit_warning: join_warnings(warnings),
+                                    });
                                 }
                                 _ => {}
                             }

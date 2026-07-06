@@ -575,6 +575,32 @@ fn device_of_longest_existing_ancestor(path: &Path) -> io::Result<u64> {
     }
 }
 
+/// The outcome of matching a case-folded stored tail against real directory entries.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CaseMatch {
+    /// Exactly one entry matches case-insensitively: the real on-disk name.
+    One(String),
+    /// No entry matches: the worktree genuinely is not there.
+    Absent,
+    /// Two or more entries differ only by case (possible on a case-sensitive volume):
+    /// never guess — skip the claim and degrade the source.
+    Ambiguous,
+}
+
+/// Case-insensitively match a stored (ASCII-folded) leaf name against real entries.
+/// Pure logic, unit-tested directly: the ambiguous branch is only REACHABLE on a
+/// case-sensitive filesystem, which the dev machine's default volume is not.
+pub fn resolve_real_case(entries: &[String], folded_tail: &str) -> CaseMatch {
+    let mut hits = entries
+        .iter()
+        .filter(|e| e.eq_ignore_ascii_case(folded_tail));
+    match (hits.next(), hits.next()) {
+        (None, _) => CaseMatch::Absent,
+        (Some(one), None) => CaseMatch::One(one.clone()),
+        (Some(_), Some(_)) => CaseMatch::Ambiguous,
+    }
+}
+
 /// Convert a path to `&str`, failing loudly on the (pathological) non-UTF-8 case rather than
 /// lossily corrupting a path handed to real git.
 fn path_str(p: &Path) -> Result<&str, GitError> {
