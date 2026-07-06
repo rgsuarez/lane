@@ -18,11 +18,9 @@ fn force_params(instance: &str) -> ClaimParams {
         repo: "ops".into(),
         lane: "demo".into(),
         instance: instance.into(),
-        target: None,
         home: Some(home()),
-        ttl_hours: None,
-        note: None,
         force: true,
+        ..Default::default()
     }
 }
 
@@ -123,11 +121,9 @@ fn renew_at_expiry_boundary_is_refused() {
         repo: "ops".into(),
         lane: "demo".into(),
         instance: "a".into(),
-        target: None,
         home: Some(home()),
         ttl_hours: Some(1.0),
-        note: None,
-        force: false,
+        ..Default::default()
     };
     claim::claim_core(&root_obj, &params, now0, &StdFs, &audit).unwrap();
     let expires = read_lock(r, "ops", "demo").unwrap().expires_at;

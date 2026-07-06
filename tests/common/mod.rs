@@ -10,9 +10,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use lane::git::{GitError, GitOutput, GitRunner};
 use lane::lock::audit::{AuditEvent, AuditEventKind, AuditSink, StdAuditSink};
 use lane::lock::{FsOps, StdFs};
 use lane::ClaimRecord;
+use std::cell::RefCell;
 use tempfile::TempDir;
 
 /// `$HOME` (required for the local-FS device check + `~` expansion).
@@ -172,4 +174,100 @@ impl AuditSink for FaultAudit {
         }
         self.inner.append(event, fsync)
     }
+}
+
+// -------------------------------------------------------------------------
+// Git seam test helpers (Slice 3): a programmable fake runner + canned outputs, and a
+// hermetic real-git scratch-repo initializer.
+// -------------------------------------------------------------------------
+
+/// A canned successful git output with the given stdout.
+pub fn git_ok(stdout: &str) -> GitOutput {
+    GitOutput {
+        code: Some(0),
+        stdout: stdout.to_string(),
+        stderr: String::new(),
+    }
+}
+
+/// A canned non-zero git output with the given code and stderr.
+pub fn git_fail(code: i32, stderr: &str) -> GitOutput {
+    GitOutput {
+        code: Some(code),
+        stdout: String::new(),
+        stderr: stderr.to_string(),
+    }
+}
+
+/// The boxed programmable handler a [`FakeGitRunner`] dispatches each call to.
+pub type FakeGitHandler = Box<dyn Fn(&[&str]) -> Result<GitOutput, GitError>>;
+
+/// A programmable [`GitRunner`] for deterministic fault injection. The handler decides the
+/// reply from the argument vector; every call is counted and logged (for zero-spawn and
+/// call-shape assertions). Single-threaded test use only (interior `RefCell`).
+pub struct FakeGitRunner {
+    handler: FakeGitHandler,
+    calls: RefCell<u32>,
+    log: RefCell<Vec<String>>,
+}
+
+impl FakeGitRunner {
+    pub fn new(handler: impl Fn(&[&str]) -> Result<GitOutput, GitError> + 'static) -> Self {
+        Self {
+            handler: Box::new(handler),
+            calls: RefCell::new(0),
+            log: RefCell::new(Vec::new()),
+        }
+    }
+    /// Total number of `run` invocations so far.
+    pub fn call_count(&self) -> u32 {
+        *self.calls.borrow()
+    }
+    /// The space-joined argument vector of every call so far.
+    pub fn calls(&self) -> Vec<String> {
+        self.log.borrow().clone()
+    }
+}
+
+impl GitRunner for FakeGitRunner {
+    fn run(&self, args: &[&str]) -> Result<GitOutput, GitError> {
+        *self.calls.borrow_mut() += 1;
+        self.log.borrow_mut().push(args.join(" "));
+        (self.handler)(args)
+    }
+}
+
+/// Initialize a hermetic scratch git repo at `dir` with one initial commit on `main`, using
+/// explicit `-c` overrides so it never depends on (or mutates) the operator's global config,
+/// signing keys, or hooks. Panics on any git failure.
+pub fn init_scratch_repo(dir: &Path) {
+    let dir_s = dir.to_str().expect("utf-8 scratch path");
+    let base: &[&str] = &[
+        "-c",
+        "user.name=Lane Test",
+        "-c",
+        "user.email=lane-test@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "init.defaultBranch=main",
+    ];
+    let git = |args: &[&str]| {
+        let mut full: Vec<&str> = base.to_vec();
+        full.extend_from_slice(args);
+        let out = Command::new("git")
+            .args(&full)
+            .output()
+            .expect("spawn git for scratch repo");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", dir_s]);
+    std::fs::write(dir.join("seed.txt"), "seed\n").expect("write seed file");
+    git(&["-C", dir_s, "add", "-A"]);
+    git(&["-C", dir_s, "commit", "-m", "seed"]);
 }

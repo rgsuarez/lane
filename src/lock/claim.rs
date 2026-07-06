@@ -135,13 +135,13 @@ pub fn claim_core(
         updated_at: now,
         expires_at: expires,
         ttl_hours: ttl,
-        linear_key: None,
-        branch: None,
-        role: None,
+        linear_key: p.linear_key.clone(),
+        branch: p.branch.clone(),
+        role: p.role,
         pr_url: None,
         gate: None,
         plan_path: None,
-        claim_status: None,
+        claim_status: p.claim_status,
         session_ref: None,
     };
 

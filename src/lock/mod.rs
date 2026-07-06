@@ -76,7 +76,11 @@ impl FsOps for StdFs {
 // Parameters and success values (the inputs/outputs of the core verbs).
 // ---------------------------------------------------------------------------
 
-/// Inputs to [`claim::claim_core`].
+/// Inputs to [`claim::claim_core`]. The four lifecycle fields (`branch`, `linear_key`,
+/// `role`, `claim_status`) default to `None` and are written into the claim record when
+/// set — a plain `lane claim` never sets them, so its on-disk record is unchanged;
+/// `lane start` passes them so its claim carries the lifecycle facts from birth.
+#[derive(Default)]
 pub struct ClaimParams {
     pub repo: String,
     pub lane: String,
@@ -86,6 +90,10 @@ pub struct ClaimParams {
     pub ttl_hours: Option<f64>,
     pub note: Option<String>,
     pub force: bool,
+    pub branch: Option<String>,
+    pub linear_key: Option<String>,
+    pub role: Option<crate::model::Role>,
+    pub claim_status: Option<crate::model::ClaimStatus>,
 }
 
 /// Result of a successful claim.
@@ -108,6 +116,22 @@ pub struct RenewParams {
 
 /// Result of a successful renew.
 pub struct RenewSuccess {
+    pub lane: String,
+    pub expires_at: DateTime<Utc>,
+    pub audit_warning: Option<String>,
+}
+
+/// Inputs to [`renew_release::handoff_core`].
+pub struct HandoffParams {
+    pub repo: String,
+    pub lane: String,
+    pub instance: String,
+    /// Optional handoff digest replacing the claim note (non-secret; excluded from audit).
+    pub note: Option<String>,
+}
+
+/// Result of a successful handoff (the claim stays held; only `claim_status` flips).
+pub struct HandoffSuccess {
     pub lane: String,
     pub expires_at: DateTime<Utc>,
     pub audit_warning: Option<String>,
@@ -448,9 +472,12 @@ pub enum Outcome {
 }
 
 /// Per-verb `data` payload (serialized inline; untagged is serialize-only here).
+/// `pub(crate)`: the lifecycle composition layer (`src/lifecycle.rs`) constructs the
+/// `Start`/`Close` variants and emits through the SAME single-envelope path — never a
+/// duplicate envelope implementation. Not part of the crate's public API.
 #[derive(Serialize)]
 #[serde(untagged)]
-enum VerbData {
+pub(crate) enum VerbData {
     Claim {
         lane: String,
         instance: String,
@@ -463,9 +490,31 @@ enum VerbData {
         lane: String,
         expires_at: DateTime<Utc>,
     },
+    Handoff {
+        lane: String,
+        claim_status: crate::model::ClaimStatus,
+        expires_at: DateTime<Utc>,
+    },
     Release {
         lane: String,
         present: bool,
+    },
+    Start {
+        lane: String,
+        instance: String,
+        expires_at: DateTime<Utc>,
+        worktree: String,
+        branch: String,
+        base: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
+    Close {
+        lane: String,
+        released: bool,
+        worktree_removed: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        skipped_missing_worktree: bool,
     },
     // Boxed: a `ClaimRecord` is far larger than the other variants (clippy large_enum_variant).
     Status(Box<StatusData>),
@@ -511,7 +560,8 @@ impl From<LaneError> for CommandError {
 }
 
 /// Render exactly one envelope (or human line) and return the process exit code.
-fn emit(
+/// `pub(crate)` for the lifecycle composition layer; not public API.
+pub(crate) fn emit(
     json: bool,
     verb: &'static str,
     repo: Option<String>,
@@ -613,10 +663,40 @@ fn human_success(
         ("renew", Some(VerbData::Renew { expires_at, .. })) => {
             format!("renewed {lane}; expires {}", expires_at.to_rfc3339())
         }
+        ("handoff", Some(VerbData::Handoff { expires_at, .. })) => {
+            format!(
+                "handoff {lane}; claim stays held, expires {}",
+                expires_at.to_rfc3339()
+            )
+        }
         ("release", _) => match outcome {
             Outcome::Released => format!("released {lane}"),
             _ => format!("{lane} was not held"),
         },
+        (
+            "start",
+            Some(VerbData::Start {
+                worktree,
+                branch,
+                expires_at,
+                warning,
+                ..
+            }),
+        ) => {
+            let w = warning
+                .as_deref()
+                .map(|w| format!("\nlane: warning: {w}"))
+                .unwrap_or_default();
+            format!(
+                "started {lane}: worktree {worktree} on branch {branch}; claim expires {}{w}",
+                expires_at.to_rfc3339()
+            )
+        }
+        ("close", Some(VerbData::Close { .. })) => match outcome {
+            Outcome::Released => format!("closed {lane}"),
+            _ => format!("{lane} was not held"),
+        },
+        ("close", None) => format!("{lane} was not held"),
         ("status", Some(VerbData::Status(sd))) => {
             if sd.present {
                 let ss = sd
@@ -656,13 +736,13 @@ fn human_success(
 // CLI runners — resolve environment, call the core, render the envelope, exit code.
 // ---------------------------------------------------------------------------
 
-use crate::cli::{ClaimArgs, ListArgs, ReleaseArgs, RenewArgs, StatusArgs};
+use crate::cli::{ClaimArgs, HandoffArgs, ListArgs, ReleaseArgs, RenewArgs, StatusArgs};
 
 fn home_env() -> Option<String> {
     std::env::var("HOME").ok()
 }
 
-fn resolve_root(
+pub(crate) fn resolve_root(
     arg: Option<PathBuf>,
     home: Option<&str>,
     fs: &dyn FsOps,
@@ -671,7 +751,7 @@ fn resolve_root(
     LaneRoot::resolve(&raw, home, fs)
 }
 
-fn require_instance(arg: Option<String>) -> Result<String, LaneError> {
+pub(crate) fn require_instance(arg: Option<String>) -> Result<String, LaneError> {
     arg.or_else(|| std::env::var("LANE_INSTANCE").ok())
         .ok_or_else(|| LaneError::Identity("--instance is required (or set $LANE_INSTANCE)".into()))
 }
@@ -699,6 +779,7 @@ fn run_claim_at(args: &ClaimArgs, now: DateTime<Utc>) -> i32 {
             ttl_hours: args.ttl_hours,
             note: args.note.clone(),
             force: args.force,
+            ..Default::default()
         };
         let s = claim::claim_core(&root, &params, now, &fs, &sink)?;
         let data = VerbData::Claim {
@@ -741,6 +822,37 @@ fn run_renew_at(args: &RenewArgs, now: DateTime<Utc>) -> i32 {
         Ok((Outcome::Ok, Some(data), s.audit_warning))
     })();
     emit(args.json, "renew", repo, lane, result)
+}
+
+/// `lane handoff` runner.
+pub fn run_handoff(args: &HandoffArgs) -> i32 {
+    run_handoff_at(args, Utc::now())
+}
+
+fn run_handoff_at(args: &HandoffArgs, now: DateTime<Utc>) -> i32 {
+    let repo = Some(args.repo.clone());
+    let lane = Some(args.lane.clone());
+    let fs = StdFs;
+    let home = home_env();
+    let result = (|| -> Result<(Outcome, Option<VerbData>, Option<String>), CommandError> {
+        let instance = require_instance(args.instance.clone())?;
+        let root = resolve_root(args.lane_root.clone(), home.as_deref(), &fs)?;
+        let sink = audit::StdAuditSink::new(root.audit_path(&args.repo), root.expected_uid());
+        let params = HandoffParams {
+            repo: args.repo.clone(),
+            lane: args.lane.clone(),
+            instance,
+            note: args.note.clone(),
+        };
+        let s = renew_release::handoff_core(&root, &params, now, &fs, &sink)?;
+        let data = VerbData::Handoff {
+            lane: s.lane,
+            claim_status: crate::model::ClaimStatus::Handoff,
+            expires_at: s.expires_at,
+        };
+        Ok((Outcome::Ok, Some(data), s.audit_warning))
+    })();
+    emit(args.json, "handoff", repo, lane, result)
 }
 
 /// `lane release` runner.

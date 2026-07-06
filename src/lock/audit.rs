@@ -45,7 +45,9 @@ pub fn next_op_id() -> String {
     format!("{nanos}-{pid}-{n}")
 }
 
-/// The closed set of audit event kinds (§S2.10).
+/// The closed set of audit event kinds (§S2.10; Slice 3 adds the spec-anticipated
+/// `handoff` — a non-destructive owner-only status flip, audited like `renew` with a
+/// single terminal event, no intent/completion pair).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditEventKind {
@@ -53,6 +55,7 @@ pub enum AuditEventKind {
     ClaimRefused,
     Renew,
     Release,
+    Handoff,
     Intent,
     Completion,
     Takeover,

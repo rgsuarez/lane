@@ -30,6 +30,9 @@ pub enum RefusedReason {
     Expired,
     /// renew was attempted against a lane that is not currently held.
     NotHeld,
+    /// `close --remove-worktree` was refused because git reports the worktree has
+    /// modified or untracked files (never removed with `--force`; the claim stays held).
+    DirtyWorktree,
 }
 
 /// The single error type returned by every fallible locking-core path.
@@ -59,6 +62,7 @@ pub enum Reason {
     MutexBusy,
     Expired,
     NotHeld,
+    DirtyWorktree,
     Identity,
     Malformed,
     NonLocalRoot,
@@ -86,6 +90,7 @@ impl LaneError {
             LaneError::Refused(RefusedReason::MutexBusy) => Reason::MutexBusy,
             LaneError::Refused(RefusedReason::Expired) => Reason::Expired,
             LaneError::Refused(RefusedReason::NotHeld) => Reason::NotHeld,
+            LaneError::Refused(RefusedReason::DirtyWorktree) => Reason::DirtyWorktree,
             LaneError::Identity(_) => Reason::Identity,
             LaneError::NonLocalRoot(_) => Reason::NonLocalRoot,
             LaneError::Malformed { .. } => Reason::Malformed,
@@ -114,6 +119,12 @@ impl fmt::Display for LaneError {
             }
             LaneError::Refused(RefusedReason::NotHeld) => {
                 write!(f, "refused: lane is not held")
+            }
+            LaneError::Refused(RefusedReason::DirtyWorktree) => {
+                write!(
+                    f,
+                    "refused: worktree has modified or untracked files (close without --remove-worktree, or clean it first)"
+                )
             }
             LaneError::Identity(m) => write!(f, "identity error: {m}"),
             LaneError::NonLocalRoot(m) => {
@@ -157,6 +168,10 @@ mod tests {
         assert_eq!(LaneError::Refused(RefusedReason::MutexBusy).exit_code(), 1);
         assert_eq!(LaneError::Refused(RefusedReason::Expired).exit_code(), 1);
         assert_eq!(LaneError::Refused(RefusedReason::NotHeld).exit_code(), 1);
+        assert_eq!(
+            LaneError::Refused(RefusedReason::DirtyWorktree).exit_code(),
+            1
+        );
         assert_eq!(LaneError::Identity("x".into()).exit_code(), 2);
         assert_eq!(LaneError::NonLocalRoot("x".into()).exit_code(), 2);
         assert_eq!(
@@ -193,5 +208,7 @@ mod tests {
         assert_eq!(j, "\"active_held\"");
         let j = serde_json::to_string(&Reason::NonLocalRoot).unwrap();
         assert_eq!(j, "\"non_local_root\"");
+        let j = serde_json::to_string(&Reason::DirtyWorktree).unwrap();
+        assert_eq!(j, "\"dirty_worktree\"");
     }
 }

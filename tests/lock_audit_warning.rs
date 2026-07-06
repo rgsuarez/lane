@@ -20,9 +20,8 @@ fn params(lane: &str, instance: &str, target: Option<&str>, force: bool) -> Clai
         instance: instance.into(),
         target: target.map(str::to_string),
         home: Some(home()),
-        ttl_hours: None,
-        note: None,
         force,
+        ..Default::default()
     }
 }
 
