@@ -216,18 +216,38 @@ fn compensate_start_failure(
     now: DateTime<Utc>,
 ) -> Option<String> {
     let mut warnings: Vec<Option<String>> = vec![claim_warning];
-    // Remove any partially-registered worktree FIRST: a worktree that git managed to
-    // register before failing keeps its branch checked out, which would make the branch
-    // delete below fail. Order matters; every fault is reported, none escalates.
-    if worktree.exists() {
-        if let Err(e) = git.worktree_remove(git_repo, worktree) {
-            warnings.push(Some(format!(
-                "cleanup: could not remove partial worktree {}: {e}",
-                worktree.display()
-            )));
-        }
-    }
+    // Cleanup is gated on branch_created: if our create_branch never succeeded, our
+    // worktree_add never ran, so anything at the path is FOREIGN and untouchable.
     if branch_created {
+        // Remove a partially-registered worktree FIRST (it keeps its branch checked
+        // out, which would block the branch delete) — but only with an OWNERSHIP
+        // PROOF: the registered worktree must be attached to the branch THIS run just
+        // created (git refuses to attach one branch to two worktrees, so a match is
+        // ours). A foreign worktree that raced onto this path is left untouched and
+        // named. Every fault is reported; none escalates.
+        match git.probe_worktree(worktree) {
+            Ok(Some(wt)) if wt.branch.as_deref() == Some(branch) => {
+                if let Err(e) = git.worktree_remove(git_repo, worktree) {
+                    warnings.push(Some(format!(
+                        "cleanup: could not remove partial worktree {}: {e}",
+                        worktree.display()
+                    )));
+                }
+            }
+            Ok(Some(_)) => {
+                warnings.push(Some(format!(
+                    "cleanup: a FOREIGN worktree occupies {} (left untouched)",
+                    worktree.display()
+                )));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warnings.push(Some(format!(
+                    "cleanup: could not inspect {}: {e}",
+                    worktree.display()
+                )));
+            }
+        }
         if let Err(e) = git.delete_branch(git_repo, branch) {
             warnings.push(Some(format!(
                 "cleanup: could not delete branch {branch}: {e}"
@@ -405,9 +425,27 @@ pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, runner: &dyn Gi
                         match record::read_claim(&lock_path, root.path(), root.expected_uid(), &fs)
                         {
                             Ok(Some(cur)) if cur.instance == instance => {}
-                            _ => {
+                            // A clean different owner is an ordinary refusal.
+                            Ok(Some(_)) => {
                                 return Err(CommandError {
                                     error: LaneError::Refused(RefusedReason::NotOwner),
+                                    audit_warning: join_warnings(warnings),
+                                });
+                            }
+                            // Vanished mid-destructive-path: stop, do not remove.
+                            Ok(None) => {
+                                return Err(CommandError {
+                                    error: LaneError::Refused(RefusedReason::NotHeld),
+                                    audit_warning: join_warnings(warnings),
+                                });
+                            }
+                            // Fail-closed reader errors (malformed, symlinked,
+                            // wrong-owner state) PROPAGATE as exit 2 — masking state
+                            // corruption as an ownership refusal would violate the
+                            // core reader contract.
+                            Err(e) => {
+                                return Err(CommandError {
+                                    error: e,
                                     audit_warning: join_warnings(warnings),
                                 });
                             }
@@ -668,6 +706,70 @@ mod tests {
         assert!(
             !root.lock_path("ops", "demo").exists(),
             "the claim is still compensating-released"
+        );
+    }
+
+    #[test]
+    fn compensation_never_removes_a_foreign_worktree_at_the_path() {
+        // Our branch was created, our worktree add failed, and a FOREIGN worktree
+        // (attached to some other branch) occupies the path: it is left untouched
+        // and named; only OUR branch is deleted.
+        let home = std::env::var("HOME").unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("lane-lc-")
+            .tempdir_in(&home)
+            .unwrap();
+        let (root, sink) = setup(tmp.path());
+        claim_demo(&root, &sink);
+
+        struct ForeignGit(std::cell::RefCell<Vec<String>>);
+        impl GitRunner for ForeignGit {
+            fn run(&self, args: &[&str]) -> Result<GitOutput, GitError> {
+                let joined = args.join(" ");
+                self.0.borrow_mut().push(joined.clone());
+                let reply = |out: &str| {
+                    Ok(GitOutput {
+                        code: Some(0),
+                        stdout: out.to_string(),
+                        stderr: String::new(),
+                    })
+                };
+                if joined.contains("is-inside-work-tree") {
+                    return reply("true");
+                }
+                if joined.contains("branch --show-current") {
+                    return reply("someone-elses-branch");
+                }
+                reply("")
+            }
+        }
+        let runner = ForeignGit(std::cell::RefCell::new(Vec::new()));
+        let git = GitAdapter::new(&runner);
+        let warning = compensate_start_failure(
+            &root,
+            "ops",
+            "demo",
+            "a",
+            Path::new("/repo"),
+            "demo-branch",
+            Path::new("/repo-demo-foreign"),
+            true,
+            &git,
+            &StdFs,
+            &sink,
+            None,
+            Utc::now(),
+        )
+        .expect("foreign occupation is named");
+        assert!(warning.contains("FOREIGN worktree"), "named: {warning}");
+        let log = runner.0.borrow().join("\n");
+        assert!(
+            !log.contains("worktree remove"),
+            "a foreign worktree is NEVER removed: {log}"
+        );
+        assert!(
+            log.contains("branch -D demo-branch"),
+            "our own branch is still deleted: {log}"
         );
     }
 

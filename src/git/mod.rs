@@ -430,7 +430,25 @@ impl<'a> GitAdapter<'a> {
             .runner
             .run(&["-C", path_s, "rev-parse", "--is-inside-work-tree"])?;
         if !(inside.success() && inside.stdout.trim() == "true") {
-            return Ok(None);
+            // A MISS (Ok(None)) is only the two benign shapes: the path is gone
+            // ("cannot change to"), or it is a plain directory under no repository
+            // ("not a git repository"). An INSPECTION failure on something that may
+            // well be a real worktree — dubious ownership, permission denied, a
+            // corrupt object store — must PROPAGATE so a destructive caller (close)
+            // fails closed instead of releasing a claim over a surviving worktree.
+            // LC_ALL=C is pinned by the runner, so the message text is stable.
+            if inside.success() {
+                return Ok(None); // printed something other than "true": not a work tree
+            }
+            let s = inside.stderr.to_ascii_lowercase();
+            let benign_miss = s.contains("cannot change to") || s.contains("not a git repository");
+            if benign_miss {
+                return Ok(None);
+            }
+            return Err(GitError::Plumbing {
+                code: inside.code,
+                stderr: inside.stderr,
+            });
         }
         let branch_out = self
             .runner
@@ -689,6 +707,44 @@ mod tests {
             })
         ));
         assert_eq!(runner.0.get(), 0, "no git spawn for a refused argument");
+    }
+
+    #[test]
+    fn probe_classifies_misses_vs_inspection_failures() {
+        struct Scripted(&'static str, Option<i32>);
+        impl GitRunner for Scripted {
+            fn run(&self, _args: &[&str]) -> Result<GitOutput, GitError> {
+                Ok(GitOutput {
+                    code: self.1,
+                    stdout: String::new(),
+                    stderr: self.0.to_string(),
+                })
+            }
+        }
+        // Benign misses -> Ok(None): path gone, or a plain dir under no repository.
+        for stderr in [
+            "fatal: cannot change to '/x': No such file or directory",
+            "fatal: not a git repository (or any of the parent directories): .git",
+        ] {
+            let r = Scripted(stderr, Some(128));
+            let git = GitAdapter::new(&r);
+            assert!(
+                git.probe_worktree(Path::new("/x")).expect("miss").is_none(),
+                "benign miss for {stderr:?}"
+            );
+        }
+        // Inspection failures on a possibly-real worktree -> Err (fail closed).
+        for stderr in [
+            "fatal: detected dubious ownership in repository at '/x'",
+            "fatal: cannot open '/x/.git': Permission denied",
+        ] {
+            let r = Scripted(stderr, Some(128));
+            let git = GitAdapter::new(&r);
+            assert!(
+                git.probe_worktree(Path::new("/x")).is_err(),
+                "inspection failure propagates for {stderr:?}"
+            );
+        }
     }
 
     #[test]
