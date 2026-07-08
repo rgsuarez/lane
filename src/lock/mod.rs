@@ -7,6 +7,7 @@
 //! `renew_release` for the per-area invariants, and `AGENTS.md` for the standing rules.
 
 pub mod audit;
+pub mod check;
 pub mod claim;
 pub mod mutex;
 pub mod paths;
@@ -521,6 +522,51 @@ pub(crate) enum VerbData {
     List {
         rows: Vec<StatusData>,
     },
+    Check {
+        path: String,
+        repo: String,
+        lane: String,
+        instance: String,
+        target: String,
+        expires_at: DateTime<Utc>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
+    HookPrint {
+        script: String,
+        snippet: bool,
+    },
+    HookInstall {
+        hooks_dir: String,
+        hook_path: String,
+        mode: String,
+        composed: bool,
+        replaced_own_block: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
+    HookStatus {
+        git_repo: String,
+        managed: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        manager: Option<String>,
+        hooks_dir: String,
+        installed: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        script_version: Option<u32>,
+        foreign_hook: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        lane_on_path: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
+    HookUninstall {
+        removed_block: bool,
+        removed_file: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
 }
 
 #[derive(Serialize)]
@@ -599,7 +645,7 @@ pub(crate) fn emit(
         }
         Err(ce) => {
             let outcome = match &ce.error {
-                LaneError::Refused(_) => Outcome::Refused,
+                LaneError::Refused(_) | LaneError::RefusedMsg { .. } => Outcome::Refused,
                 _ => Outcome::Error,
             };
             if json {
@@ -708,6 +754,111 @@ fn human_success(
                 format!("{lane}: not held")
             }
         }
+        (
+            "check",
+            Some(VerbData::Check {
+                path,
+                repo,
+                lane: claim_lane,
+                expires_at,
+                warning,
+                ..
+            }),
+        ) => {
+            let w = warning
+                .as_deref()
+                .map(|w| format!("\nlane: warning: {w}"))
+                .unwrap_or_default();
+            format!(
+                "covered: {path} by {repo}/{claim_lane}; expires {}{w}",
+                expires_at.to_rfc3339()
+            )
+        }
+        // stdout IS the script for a human `hook print` (pipe it straight into a file).
+        ("hook.print", Some(VerbData::HookPrint { script, .. })) => script.trim_end().to_string(),
+        (
+            "hook.install",
+            Some(VerbData::HookInstall {
+                hook_path,
+                mode,
+                composed,
+                warning,
+                ..
+            }),
+        ) => {
+            let c = if *composed {
+                " (composed with an existing hook)"
+            } else {
+                ""
+            };
+            let w = warning
+                .as_deref()
+                .map(|w| format!("\nlane: warning: {w}"))
+                .unwrap_or_default();
+            format!("installed pre-commit guard: {hook_path}; mode {mode}{c}{w}")
+        }
+        (
+            "hook.status",
+            Some(VerbData::HookStatus {
+                git_repo,
+                managed,
+                manager,
+                hooks_dir,
+                installed,
+                script_version,
+                foreign_hook,
+                mode,
+                lane_on_path,
+                warning,
+            }),
+        ) => {
+            let installed_s = match (installed, script_version) {
+                (true, Some(v)) => format!(
+                    "yes (v{v}{})",
+                    if *foreign_hook {
+                        ", composed with a foreign hook"
+                    } else {
+                        ""
+                    }
+                ),
+                (true, None) => "yes".to_string(),
+                (false, _) if *foreign_hook => "no (a foreign hook is present)".to_string(),
+                (false, _) => "no".to_string(),
+            };
+            let managed_s = match (managed, manager.as_deref()) {
+                (true, Some(m)) => format!("yes ({m})"),
+                (true, None) => "yes".to_string(),
+                (false, _) => "no".to_string(),
+            };
+            let w = warning
+                .as_deref()
+                .map(|w| format!("\nlane: warning: {w}"))
+                .unwrap_or_default();
+            format!(
+                "repo: {git_repo}\nhooks dir: {hooks_dir} (managed: {managed_s})\ninstalled: {installed_s}\nmode: {}\nlane on PATH: {}{w}",
+                mode.as_deref().unwrap_or("(unset; hook defaults to advise)"),
+                if *lane_on_path { "yes" } else { "no" },
+            )
+        }
+        (
+            "hook.uninstall",
+            Some(VerbData::HookUninstall {
+                removed_block,
+                removed_file,
+                warning,
+            }),
+        ) => {
+            let what = match (removed_block, removed_file) {
+                (true, true) => "removed the lane-owned pre-commit hook".to_string(),
+                (true, false) => "removed the lane block; foreign hook restored".to_string(),
+                (false, _) => "nothing installed; nothing removed".to_string(),
+            };
+            let w = warning
+                .as_deref()
+                .map(|w| format!("\nlane: warning: {w}"))
+                .unwrap_or_default();
+            format!("{what}{w}")
+        }
         ("list", Some(VerbData::List { rows })) => {
             if rows.is_empty() {
                 "(no claims)".to_string()
@@ -736,7 +887,7 @@ fn human_success(
 // CLI runners — resolve environment, call the core, render the envelope, exit code.
 // ---------------------------------------------------------------------------
 
-use crate::cli::{ClaimArgs, HandoffArgs, ListArgs, ReleaseArgs, RenewArgs, StatusArgs};
+use crate::cli::{CheckArgs, ClaimArgs, HandoffArgs, ListArgs, ReleaseArgs, RenewArgs, StatusArgs};
 
 fn home_env() -> Option<String> {
     std::env::var("HOME").ok()
@@ -932,6 +1083,64 @@ fn run_list_at(args: &ListArgs, now: DateTime<Utc>) -> i32 {
         Ok((Outcome::Ok, Some(VerbData::List { rows }), None))
     })();
     emit(args.json, "list", repo, None, result)
+}
+
+/// Resolve the queried `check` path: default cwd; relative input absolutized against
+/// cwd; `~`/`$HOME` forms left for `Target::resolve`'s own expansion. `..` components
+/// survive to `Target::resolve`, which rejects them (exit 2) like any claim target.
+fn resolve_query_path(arg: Option<&str>) -> Result<String, LaneError> {
+    let cwd = || std::env::current_dir().map_err(LaneError::Io);
+    match arg {
+        None => Ok(cwd()?.to_string_lossy().into_owned()),
+        Some(p) => {
+            if Path::new(p).is_absolute() || p.starts_with('~') || p.starts_with("$HOME") {
+                Ok(p.to_string())
+            } else {
+                Ok(cwd()?.join(p).to_string_lossy().into_owned())
+            }
+        }
+    }
+}
+
+/// `lane check` runner (read-only coverage verdict).
+pub fn run_check(args: &CheckArgs) -> i32 {
+    run_check_at(args, Utc::now())
+}
+
+fn run_check_at(args: &CheckArgs, now: DateTime<Utc>) -> i32 {
+    let repo = args.repo.clone();
+    let fs = StdFs;
+    let home = home_env();
+    let result = (|| -> Result<(Outcome, Option<VerbData>, Option<String>), CommandError> {
+        if let Some(r) = &args.repo {
+            validate_name("repo", r)?;
+        }
+        let instance = check::resolve_check_identity(args.instance.clone())?;
+        let root = resolve_root(args.lane_root.clone(), home.as_deref(), &fs)?;
+        let path = resolve_query_path(args.path.as_deref())?;
+        let s = check::check_core(
+            &root,
+            &check::CheckParams {
+                repo: args.repo.clone(),
+                path,
+                instance,
+                home: home.clone(),
+            },
+            now,
+            &fs,
+        )?;
+        let data = VerbData::Check {
+            path: s.path,
+            repo: s.repo,
+            lane: s.lane,
+            instance: s.instance,
+            target: s.target,
+            expires_at: s.expires_at,
+            warning: s.warning,
+        };
+        Ok((Outcome::Ok, Some(data), None))
+    })();
+    emit(args.json, "check", repo, None, result)
 }
 
 /// Liveness for read verbs is always `Unknown` in Slice 2 (no overseer/tmux), so

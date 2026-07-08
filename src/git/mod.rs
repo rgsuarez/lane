@@ -517,6 +517,107 @@ impl<'a> GitAdapter<'a> {
             })
     }
 
+    /// `git -C <path> rev-parse --show-toplevel` — the working-tree top level (a
+    /// worktree's OWN toplevel when run inside one; empty for a bare repo → error).
+    pub fn toplevel(&self, path: &Path) -> Result<PathBuf, GitError> {
+        let path_s = path_str(path)?;
+        let out = self
+            .runner
+            .run(&["-C", path_s, "rev-parse", "--show-toplevel"])?;
+        if !out.success() {
+            return Err(GitError::Plumbing {
+                code: out.code,
+                stderr: out.stderr,
+            });
+        }
+        let top = out.stdout.trim();
+        if top.is_empty() {
+            return Err(GitError::Plumbing {
+                code: Some(0),
+                stderr: "rev-parse --show-toplevel printed nothing (bare repository?)".into(),
+            });
+        }
+        Ok(PathBuf::from(top))
+    }
+
+    /// The RESOLVED hooks directory, via `git -C <repo> rev-parse --path-format=absolute
+    /// --git-path hooks`: honors `core.hooksPath` when set; otherwise the shared
+    /// `<common-dir>/hooks` — which is why ONE hook install covers the canonical checkout
+    /// and every worktree. `--path-format=absolute` already absolutizes; the defensive
+    /// join covers a runner printing a relative path anyway.
+    pub fn hooks_dir(&self, repo: &Path) -> Result<PathBuf, GitError> {
+        let repo_s = path_str(repo)?;
+        let out = self.runner.run(&[
+            "-C",
+            repo_s,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "hooks",
+        ])?;
+        if !out.success() {
+            return Err(GitError::Plumbing {
+                code: out.code,
+                stderr: out.stderr,
+            });
+        }
+        let p = out.stdout.trim();
+        if p.is_empty() {
+            return Err(GitError::Plumbing {
+                code: Some(0),
+                stderr: "rev-parse --git-path hooks printed nothing".into(),
+            });
+        }
+        let pb = PathBuf::from(p);
+        Ok(if pb.is_absolute() { pb } else { repo.join(pb) })
+    }
+
+    /// `git -C <repo> config --get <key>` — `Ok(None)` when the key is unset (exit 1).
+    pub fn config_get(&self, repo: &Path, key: &str) -> Result<Option<String>, GitError> {
+        let repo_s = path_str(repo)?;
+        require_flag_safe("config key", key)?;
+        let out = self.runner.run(&["-C", repo_s, "config", "--get", key])?;
+        match out.code {
+            Some(0) => Ok(Some(out.stdout.trim().to_string())),
+            Some(1) => Ok(None),
+            _ => Err(GitError::Plumbing {
+                code: out.code,
+                stderr: out.stderr,
+            }),
+        }
+    }
+
+    /// `git -C <repo> config <key> <value>` — REPO-local config only, never `--global`.
+    pub fn config_set(&self, repo: &Path, key: &str, value: &str) -> Result<(), GitError> {
+        let repo_s = path_str(repo)?;
+        require_flag_safe("config key", key)?;
+        require_flag_safe("config value", value)?;
+        let out = self.runner.run(&["-C", repo_s, "config", key, value])?;
+        if out.success() {
+            Ok(())
+        } else {
+            Err(GitError::Plumbing {
+                code: out.code,
+                stderr: out.stderr,
+            })
+        }
+    }
+
+    /// `git -C <repo> config --unset <key>` — an already-absent key (exit 5) is Ok, so
+    /// uninstall stays idempotent.
+    pub fn config_unset(&self, repo: &Path, key: &str) -> Result<(), GitError> {
+        let repo_s = path_str(repo)?;
+        require_flag_safe("config key", key)?;
+        let out = self.runner.run(&["-C", repo_s, "config", "--unset", key])?;
+        match out.code {
+            Some(0) | Some(5) => Ok(()),
+            _ => Err(GitError::Plumbing {
+                code: out.code,
+                stderr: out.stderr,
+            }),
+        }
+    }
+
     /// Read-only prechecks for `start`, run BEFORE any claim: the repo must be a real git
     /// repo, the branch must not already exist, and the worktree path must not exist. On
     /// success the target is safe to create (and the branch is known-absent, so a later
@@ -750,6 +851,107 @@ mod tests {
                 "inspection failure propagates for {stderr:?}"
             );
         }
+    }
+
+    #[test]
+    fn hooks_dir_and_config_shapes() {
+        struct Log(std::cell::RefCell<Vec<String>>, &'static str, Option<i32>);
+        impl GitRunner for Log {
+            fn run(&self, args: &[&str]) -> Result<GitOutput, GitError> {
+                self.0.borrow_mut().push(args.join(" "));
+                Ok(GitOutput {
+                    code: self.2,
+                    stdout: self.1.to_string(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        // hooks_dir absolutizes a (defensively assumed) relative reply against the repo.
+        let r = Log(Default::default(), ".husky/_\n", Some(0));
+        let git = GitAdapter::new(&r);
+        let d = git.hooks_dir(Path::new("/repo")).unwrap();
+        assert_eq!(d, PathBuf::from("/repo/.husky/_"));
+        assert_eq!(
+            r.0.borrow()[0],
+            "-C /repo rev-parse --path-format=absolute --git-path hooks"
+        );
+        // An absolute reply is taken as-is.
+        let r = Log(Default::default(), "/repo/.git/hooks\n", Some(0));
+        let git = GitAdapter::new(&r);
+        assert_eq!(
+            git.hooks_dir(Path::new("/repo")).unwrap(),
+            PathBuf::from("/repo/.git/hooks")
+        );
+        // config --get: exit 1 = unset = None; exit 0 = trimmed value.
+        let r = Log(Default::default(), "", Some(1));
+        let git = GitAdapter::new(&r);
+        assert_eq!(
+            git.config_get(Path::new("/repo"), "lane.hook.mode")
+                .unwrap(),
+            None
+        );
+        let r = Log(Default::default(), "advise\n", Some(0));
+        let git = GitAdapter::new(&r);
+        assert_eq!(
+            git.config_get(Path::new("/repo"), "lane.hook.mode")
+                .unwrap(),
+            Some("advise".to_string())
+        );
+        // config --unset: absent key (exit 5) is Ok (idempotent uninstall).
+        let r = Log(Default::default(), "", Some(5));
+        let git = GitAdapter::new(&r);
+        assert!(git
+            .config_unset(Path::new("/repo"), "lane.hook.mode")
+            .is_ok());
+        // toplevel: trimmed; empty output (bare repo) is a plumbing error.
+        let r = Log(Default::default(), "/repo\n", Some(0));
+        let git = GitAdapter::new(&r);
+        assert_eq!(
+            git.toplevel(Path::new("/repo/sub")).unwrap(),
+            PathBuf::from("/repo")
+        );
+        let r = Log(Default::default(), "", Some(0));
+        let git = GitAdapter::new(&r);
+        assert!(git.toplevel(Path::new("/repo")).is_err());
+    }
+
+    #[test]
+    fn config_args_are_flag_safety_guarded() {
+        struct Counting(std::cell::Cell<u32>);
+        impl GitRunner for Counting {
+            fn run(&self, _args: &[&str]) -> Result<GitOutput, GitError> {
+                self.0.set(self.0.get() + 1);
+                Ok(GitOutput {
+                    code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let runner = Counting(std::cell::Cell::new(0));
+        let git = GitAdapter::new(&runner);
+        assert!(matches!(
+            git.config_get(Path::new("/r"), "--global"),
+            Err(GitError::FlagLikeArgument {
+                what: "config key",
+                ..
+            })
+        ));
+        assert!(matches!(
+            git.config_set(Path::new("/r"), "lane.hook.mode", "--unset-all"),
+            Err(GitError::FlagLikeArgument {
+                what: "config value",
+                ..
+            })
+        ));
+        assert!(matches!(
+            git.config_unset(Path::new("/r"), "-f"),
+            Err(GitError::FlagLikeArgument {
+                what: "config key",
+                ..
+            })
+        ));
+        assert_eq!(runner.0.get(), 0, "no git spawn for a refused argument");
     }
 
     #[test]

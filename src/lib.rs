@@ -10,6 +10,7 @@ pub mod board;
 pub mod cli;
 pub mod error;
 pub mod git;
+pub mod hook;
 pub mod lifecycle;
 pub mod lock;
 pub mod model;

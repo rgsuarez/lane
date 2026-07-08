@@ -35,12 +35,19 @@ lane claim     # atomic claim of a lane (offline-capable)
 lane renew     # extend a held claim (owner-only)
 lane release   # release a held claim (owner-only)
 lane status    # read-only status of one lane (--json)
+lane list      # read-only listing of claims (all namespaces, or one --repo)
+lane check     # read-only: does an active caller-owned claim cover a path? (Slice 3.5)
+lane hook      # git pre-commit guard: print|install|status|uninstall (Slice 3.5)
 lane pair      # attach advisor to executor (same Linear key)
 lane handoff   # flip claim_status:handoff + write digest
 lane close     # release + draft Linear closeout (gated write)
 lane migrate   # Vantage-LOE → Linear, archive-first (gated batch)
 ```
 Verbs mirror the proven `vantage lane` + `zeos-lane` vocabulary. `--json` on all read verbs.
+`hook` is lane's first commit-time-enforcement surface (a deliberate Slice 3.5 boundary
+expansion, ZER-84): the installed pre-commit hook runs `lane check` and — in `enforce`
+mode — refuses an uncovered commit fail-closed, converting the "first agent needs no
+claim" convention into a mechanical gate at the commit choke point.
 
 ## 5. Config & data model
 
@@ -91,6 +98,7 @@ plan_path, claim_status(active|blocked|handoff), session_ref
 - **Pair/advisor (ported from Vantage):** `role:executor|advisor` on the claim; advisor references the same Linear key; 7-var env contract + bootstrap-markdown injection; active-parent doctrine (advisor refuses a non-active parent); handoff flips `claim_status:handoff` + writes a digest.
 - **Audit:** append-only JSONL `{event: claim|renew|release|force|takeover|handoff|secret_requested, lane, linear_key, instance, role, ts}`.
 - **Stale/orphan:** `EXPIRED` (past TTL) / `possibly-stale` (active, idle >3h) / `orphaned` (active, no live session) — surfaced by `lane board`; **release always operator-gated**, never auto-stolen.
+- **Commit guard (Slice 3.5):** `lane check` answers "does an ACTIVE claim owned by THIS instance equal-or-ancestor-cover this path?" (read-only, offline, all-namespace scan by default — namespace inference from a worktree's toplevel basename is wrong by construction; identity required, never guessed). `lane hook install` writes a marked pre-commit block into the repo's RESOLVED hooks dir (one install covers all worktrees), composing with — never clobbering — foreign hooks; a managed `core.hooksPath` (husky et al.) is refused with the exact paste-in snippet. Modes via `git config lane.hook.mode`: `advise` (warn, default) / `enforce` (fail closed); `LANE_HOOK_BYPASS=1` is the loud human bypass. The hook never auto-claims and never mutates lane state. Residual: `git commit --no-verify` skips pre-commit — consumer doctrine forbids it for agents; a CI-side backstop is a later slice.
 
 ## 9. Offline / local-only mode (REQUIRED — first-class constraint)
 
@@ -132,7 +140,7 @@ Full per-surface enumeration with migration mechanics is in
 
 ## 15. Implementation slices (reference)
 
-0a (this doc + the inventory) → 0b doctrine edits (gated) → 1 read-only `lane board` → 2 locking core + offline mode → 3 lane lifecycle + pairing + zeos skill-wrap → 4 Linear read adapter + 1Password + gated writes → 5 migration tooling + installer. Daemon/dashboard + hard cross-host locking are later embed-first COAs.
+0a (this doc + the inventory) → 0b doctrine edits (gated) → 1 read-only `lane board` → 2 locking core + offline mode → 3 lane lifecycle + pairing + zeos skill-wrap → **3.5 commit-guard adapter (`check` + `hook`, ZER-84)** → 4 Linear read adapter + 1Password + gated writes → 5 migration tooling + installer. Daemon/dashboard + hard cross-host locking are later embed-first COAs.
 
 ## 16. Test strategy
 

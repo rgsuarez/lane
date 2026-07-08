@@ -48,12 +48,97 @@ pub enum Command {
     Status(StatusArgs),
     /// Read-only listing of claims (all namespaces, or one `--repo`).
     List(ListArgs),
+    /// Read-only coverage verdict: does an active claim owned by this instance cover a
+    /// path? (exit 0 covered; 1 refused: uncovered | foreign_owner | no_identity).
+    Check(CheckArgs),
     /// Create a branch + git worktree and claim the lane with the worktree as its target
     /// (claim-first; no session is spawned).
     Start(StartArgs),
     /// Release an owned lane, optionally removing its git worktree first (never forced;
     /// a dirty worktree refuses and the claim stays held).
     Close(CloseArgs),
+    /// Git pre-commit guard: print/install/status/uninstall the claim-coverage hook.
+    Hook(HookArgs),
+}
+
+/// `lane hook <print|install|status|uninstall>` — the pre-commit guard family. Never
+/// touches lane state (no `--lane-root`): the installed hook's `lane check` resolves
+/// `$LANE_ROOT`/`$LANE_INSTANCE` from the committing process environment.
+#[derive(Args, Debug)]
+pub struct HookArgs {
+    #[command(subcommand)]
+    pub cmd: HookCmd,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HookCmd {
+    /// Print the guard script (or `--snippet` for the paste-into-managed-hooks block).
+    Print(HookPrintArgs),
+    /// Install the guard into a repo's RESOLVED hooks dir (composes; never clobbers).
+    Install(HookInstallArgs),
+    /// Read-only report: managed? installed? version? mode? (exit 0 when answerable).
+    Status(HookStatusArgs),
+    /// Remove exactly the lane-owned block/file (never guesses; damaged markers refuse).
+    Uninstall(HookUninstallArgs),
+}
+
+/// Guard posture stored in the consumer repo's git config (`lane.hook.mode`).
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookMode {
+    /// Warn on an uncovered commit, then allow it (the soak default).
+    Advise,
+    /// Fail closed on an uncovered commit (bypass: `LANE_HOOK_BYPASS=1`).
+    Enforce,
+}
+
+/// `lane hook print [--snippet] [--repo <ns>] [--json]`.
+#[derive(Args, Debug)]
+pub struct HookPrintArgs {
+    /// Emit the bare marked block (for managed hooks like husky) instead of a full script.
+    #[arg(long)]
+    pub snippet: bool,
+    /// Bake `--repo <ns>` into the guard's `lane check` line.
+    #[arg(long)]
+    pub repo: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `lane hook install [--git-repo <abs>] [--repo <ns>] [--mode <advise|enforce>] [--json]`.
+#[derive(Args, Debug)]
+pub struct HookInstallArgs {
+    /// The git repository (or any path inside it). Absolute; default: cwd.
+    #[arg(long)]
+    pub git_repo: Option<PathBuf>,
+    /// Guard mode to record in `lane.hook.mode`. Omitted: keep the existing value, or
+    /// default `advise` when unset (a re-install never downgrades an enforce).
+    #[arg(long, value_enum)]
+    pub mode: Option<HookMode>,
+    /// Bake `--repo <ns>` into the guard's `lane check` line.
+    #[arg(long)]
+    pub repo: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `lane hook status [--git-repo <abs>] [--json]` (read-only).
+#[derive(Args, Debug)]
+pub struct HookStatusArgs {
+    /// The git repository (or any path inside it). Absolute; default: cwd.
+    #[arg(long)]
+    pub git_repo: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `lane hook uninstall [--git-repo <abs>] [--json]`.
+#[derive(Args, Debug)]
+pub struct HookUninstallArgs {
+    /// The git repository (or any path inside it). Absolute; default: cwd.
+    #[arg(long)]
+    pub git_repo: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `lane claim <lane> --repo <repo> [--target <abs>] [--ttl-hours <h>] [--note <s>] [--force] [--json]`
@@ -158,6 +243,32 @@ pub struct ListArgs {
     pub json: bool,
     #[arg(long)]
     pub lane_root: Option<PathBuf>,
+}
+
+/// `lane check [--path <p>] [--repo <ns>] [--json]` (read-only coverage verdict). The
+/// scan defaults to ALL namespaces — claim targets are machine-global paths, and
+/// namespace inference from a git toplevel basename is wrong inside worktrees; `--repo`
+/// narrows the scan and the suggested fix command. Identity is required (refused
+/// `no_identity` when absent — never guessed), so the pre-commit hook fails closed on an
+/// identity-less session instead of passing on someone else's covering claim.
+#[derive(Args, Debug)]
+pub struct CheckArgs {
+    /// Path to check (absolute or cwd-relative; default: cwd).
+    #[arg(long)]
+    pub path: Option<String>,
+    /// Narrow the scan (and the suggested fix command) to one repo namespace.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Emit the JSON envelope instead of a human line. On refusal the envelope carries
+    /// the machine reason; the prose fix text is human-mode stderr.
+    #[arg(long)]
+    pub json: bool,
+    /// Override `$LANE_ROOT` (else `~/.lane`). Absolute path.
+    #[arg(long)]
+    pub lane_root: Option<PathBuf>,
+    /// Caller identity (required; or `$LANE_INSTANCE`). Never guessed.
+    #[arg(long)]
+    pub instance: Option<String>,
 }
 
 /// `lane start <lane> --repo <ns> --git-repo <abs> [--branch] [--base] [--worktree]

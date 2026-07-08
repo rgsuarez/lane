@@ -237,6 +237,65 @@ impl GitRunner for FakeGitRunner {
     }
 }
 
+/// Run `lane <args>` WITHOUT the `--lane-root` injection: the `hook` family takes no
+/// `--lane-root` (it never touches lane state), so [`run`] would be a Clap usage error.
+/// Baseline-scrubs the hook-relevant env; callers overlay what a test needs.
+pub fn run_hook(args: &[&str]) -> Output {
+    let mut c = Command::new(bin());
+    c.args(args);
+    c.env_remove("LANE_ROOT");
+    c.env_remove("LANE_INSTANCE");
+    c.env_remove("LANE_HOOK_BYPASS");
+    c.output().expect("spawn lane hook")
+}
+
+/// A `$PATH` for hook-driven `git commit`s: the FRESHLY BUILT binary's dir first (never
+/// a stale `~/.cargo/bin/lane`), then the system dirs `git`/`sh` live in.
+pub fn hook_test_path() -> String {
+    let bin_dir = Path::new(bin())
+        .parent()
+        .expect("bin dir")
+        .to_string_lossy()
+        .into_owned();
+    format!("{bin_dir}:/usr/bin:/bin")
+}
+
+/// `git commit --allow-empty` in a scratch repo with hermetic identity/signing `-c`
+/// overrides (the operator's global config has `commit.gpgsign=true`). The hook's
+/// environment is fully controlled: a baseline scrub of `LANE_ROOT`/`LANE_INSTANCE`/
+/// `LANE_HOOK_BYPASS`, then the caller's `envs` overlay (PATH, LANE_ROOT, …).
+pub fn scratch_commit(dir: &Path, msg: &str, envs: &[(&str, &str)]) -> Output {
+    let mut c = Command::new("git");
+    c.args([
+        "-c",
+        "user.name=Lane Test",
+        "-c",
+        "user.email=lane-test@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "-C",
+        dir.to_str().expect("utf-8 scratch path"),
+        "commit",
+        "--allow-empty",
+        "-m",
+        msg,
+    ]);
+    c.env_remove("LANE_ROOT");
+    c.env_remove("LANE_INSTANCE");
+    c.env_remove("LANE_HOOK_BYPASS");
+    for (k, v) in envs {
+        c.env(k, v);
+    }
+    c.output().expect("spawn git commit")
+}
+
+/// Plain `git -C <dir> <args>` for test-side repo state (config flips, worktree add).
+pub fn scratch_git(dir: &Path, args: &[&str]) -> Output {
+    let mut c = Command::new("git");
+    c.arg("-C").arg(dir).args(args);
+    c.output().expect("spawn git")
+}
+
 /// Initialize a hermetic scratch git repo at `dir` with one initial commit on `main`, using
 /// explicit `-c` overrides so it never depends on (or mutates) the operator's global config,
 /// signing keys, or hooks. Panics on any git failure.

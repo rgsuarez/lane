@@ -33,6 +33,38 @@ pub enum RefusedReason {
     /// `close --remove-worktree` was refused because git reports the worktree has
     /// modified or untracked files (never removed with `--force`; the claim stays held).
     DirtyWorktree,
+    /// `check`: no active claim owned by the caller covers the queried path (includes
+    /// expired-only and target-less-only near-misses — the message says which).
+    Uncovered,
+    /// `check`: the queried path is covered by an active claim held by a DIFFERENT
+    /// instance — the collision case the guard exists to surface.
+    ForeignOwner,
+    /// `check`: no caller identity was provided (`--instance` / `$LANE_INSTANCE`).
+    /// ABSENCE is a safe refusal (exit 1); an INVALID identity stays `Identity` (exit 2).
+    NoIdentity,
+    /// `hook`: lane refuses to compose/modify a git hook file it cannot edit safely
+    /// (managed `core.hooksPath`, symlink, non-executable / non-text / oversize file,
+    /// damaged markers). One machine reason; the message carries the case detail.
+    HookComposeRefused,
+}
+
+impl RefusedReason {
+    /// The JSON `reason` code for this refusal (the closed envelope enum).
+    fn to_reason(self) -> Reason {
+        match self {
+            RefusedReason::ActiveHeld => Reason::ActiveHeld,
+            RefusedReason::NotOwner => Reason::NotOwner,
+            RefusedReason::TargetOverlap => Reason::TargetOverlap,
+            RefusedReason::MutexBusy => Reason::MutexBusy,
+            RefusedReason::Expired => Reason::Expired,
+            RefusedReason::NotHeld => Reason::NotHeld,
+            RefusedReason::DirtyWorktree => Reason::DirtyWorktree,
+            RefusedReason::Uncovered => Reason::Uncovered,
+            RefusedReason::ForeignOwner => Reason::ForeignOwner,
+            RefusedReason::NoIdentity => Reason::NoIdentity,
+            RefusedReason::HookComposeRefused => Reason::HookComposeRefused,
+        }
+    }
 }
 
 /// The single error type returned by every fallible locking-core path.
@@ -40,6 +72,11 @@ pub enum RefusedReason {
 pub enum LaneError {
     /// A safe, expected refusal (exit 1).
     Refused(RefusedReason),
+    /// A safe refusal (exit 1) carrying a fully-composed, non-secret context message.
+    /// `reason` is the closed machine code for the envelope; `msg` is the human fix text
+    /// (Display prints `refused: {msg}` — for `check`/`hook` the message IS the exact fix
+    /// command with real values). The closed [`Reason`] enum stays payload-free.
+    RefusedMsg { reason: RefusedReason, msg: String },
     /// Identity-inconsistent on-disk state, interior-state symlink, or a post-parse
     /// validation failure (exit 2).
     Identity(String),
@@ -63,6 +100,10 @@ pub enum Reason {
     Expired,
     NotHeld,
     DirtyWorktree,
+    Uncovered,
+    ForeignOwner,
+    NoIdentity,
+    HookComposeRefused,
     Identity,
     Malformed,
     NonLocalRoot,
@@ -73,7 +114,7 @@ impl LaneError {
     /// Process exit code: `1` for refusals, `2` for everything else.
     pub fn exit_code(&self) -> i32 {
         match self {
-            LaneError::Refused(_) => 1,
+            LaneError::Refused(_) | LaneError::RefusedMsg { .. } => 1,
             LaneError::Identity(_)
             | LaneError::NonLocalRoot(_)
             | LaneError::Malformed { .. }
@@ -84,13 +125,8 @@ impl LaneError {
     /// The JSON `reason` for the error envelope.
     pub fn reason(&self) -> Reason {
         match self {
-            LaneError::Refused(RefusedReason::ActiveHeld) => Reason::ActiveHeld,
-            LaneError::Refused(RefusedReason::NotOwner) => Reason::NotOwner,
-            LaneError::Refused(RefusedReason::TargetOverlap) => Reason::TargetOverlap,
-            LaneError::Refused(RefusedReason::MutexBusy) => Reason::MutexBusy,
-            LaneError::Refused(RefusedReason::Expired) => Reason::Expired,
-            LaneError::Refused(RefusedReason::NotHeld) => Reason::NotHeld,
-            LaneError::Refused(RefusedReason::DirtyWorktree) => Reason::DirtyWorktree,
+            LaneError::Refused(r) => r.to_reason(),
+            LaneError::RefusedMsg { reason, .. } => reason.to_reason(),
             LaneError::Identity(_) => Reason::Identity,
             LaneError::NonLocalRoot(_) => Reason::NonLocalRoot,
             LaneError::Malformed { .. } => Reason::Malformed,
@@ -126,6 +162,27 @@ impl fmt::Display for LaneError {
                     "refused: worktree has modified or untracked files (close without --remove-worktree, or clean it first)"
                 )
             }
+            // Generic fallbacks for the context-rich refusals (defensive exhaustiveness;
+            // `check`/`hook` normally construct `RefusedMsg` with the composed fix text).
+            LaneError::Refused(RefusedReason::Uncovered) => {
+                write!(f, "refused: path is not covered by an active claim")
+            }
+            LaneError::Refused(RefusedReason::ForeignOwner) => {
+                write!(
+                    f,
+                    "refused: path is covered by a claim held by another instance"
+                )
+            }
+            LaneError::Refused(RefusedReason::NoIdentity) => {
+                write!(
+                    f,
+                    "refused: no caller identity; pass --instance <id> or export LANE_INSTANCE=<id>"
+                )
+            }
+            LaneError::Refused(RefusedReason::HookComposeRefused) => {
+                write!(f, "refused: cannot compose the git hook safely")
+            }
+            LaneError::RefusedMsg { msg, .. } => write!(f, "refused: {msg}"),
             LaneError::Identity(m) => write!(f, "identity error: {m}"),
             LaneError::NonLocalRoot(m) => {
                 write!(f, "lane root is not on a local filesystem: {m}")
@@ -172,6 +229,24 @@ mod tests {
             LaneError::Refused(RefusedReason::DirtyWorktree).exit_code(),
             1
         );
+        assert_eq!(LaneError::Refused(RefusedReason::Uncovered).exit_code(), 1);
+        assert_eq!(
+            LaneError::Refused(RefusedReason::ForeignOwner).exit_code(),
+            1
+        );
+        assert_eq!(LaneError::Refused(RefusedReason::NoIdentity).exit_code(), 1);
+        assert_eq!(
+            LaneError::Refused(RefusedReason::HookComposeRefused).exit_code(),
+            1
+        );
+        assert_eq!(
+            LaneError::RefusedMsg {
+                reason: RefusedReason::Uncovered,
+                msg: "x".into()
+            }
+            .exit_code(),
+            1
+        );
         assert_eq!(LaneError::Identity("x".into()).exit_code(), 2);
         assert_eq!(LaneError::NonLocalRoot("x".into()).exit_code(), 2);
         assert_eq!(
@@ -200,6 +275,18 @@ mod tests {
             LaneError::NonLocalRoot("x".into()).reason(),
             Reason::NonLocalRoot
         );
+        assert_eq!(
+            LaneError::RefusedMsg {
+                reason: RefusedReason::ForeignOwner,
+                msg: "held by other".into()
+            }
+            .reason(),
+            Reason::ForeignOwner
+        );
+        assert_eq!(
+            LaneError::Refused(RefusedReason::NoIdentity).reason(),
+            Reason::NoIdentity
+        );
     }
 
     #[test]
@@ -210,5 +297,25 @@ mod tests {
         assert_eq!(j, "\"non_local_root\"");
         let j = serde_json::to_string(&Reason::DirtyWorktree).unwrap();
         assert_eq!(j, "\"dirty_worktree\"");
+        let j = serde_json::to_string(&Reason::Uncovered).unwrap();
+        assert_eq!(j, "\"uncovered\"");
+        let j = serde_json::to_string(&Reason::ForeignOwner).unwrap();
+        assert_eq!(j, "\"foreign_owner\"");
+        let j = serde_json::to_string(&Reason::NoIdentity).unwrap();
+        assert_eq!(j, "\"no_identity\"");
+        let j = serde_json::to_string(&Reason::HookComposeRefused).unwrap();
+        assert_eq!(j, "\"hook_compose_refused\"");
+    }
+
+    #[test]
+    fn refused_msg_display_carries_the_composed_text() {
+        let e = LaneError::RefusedMsg {
+            reason: RefusedReason::Uncovered,
+            msg: "no active claim covers /x; fix: lane claim demo --repo ops --target /x".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "refused: no active claim covers /x; fix: lane claim demo --repo ops --target /x"
+        );
     }
 }

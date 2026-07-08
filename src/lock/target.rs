@@ -89,6 +89,14 @@ impl Target {
     pub fn overlaps(&self, other: &Target) -> bool {
         overlap_segments(&self.segments, &other.segments)
     }
+
+    /// True when `self` (a claim's stored target) equals or is an ANCESTOR of `other`
+    /// (a queried path). Directional coverage: a deeper query is covered by a shallower
+    /// claim, never the reverse — [`Self::overlaps`] is bidirectional and unsuitable.
+    pub fn covers(&self, other: &Target) -> bool {
+        let n = self.segments.len();
+        n > 0 && n <= other.segments.len() && self.segments[..] == other.segments[..n]
+    }
 }
 
 /// Expand a leading `~` or `~/...` (and a literal `$HOME` prefix) using `home`.
@@ -195,6 +203,16 @@ mod tests {
         assert!(a.overlaps(&c)); // ancestor
         assert!(c.overlaps(&a)); // descendant
         assert!(!a.overlaps(&d)); // siblings
+    }
+
+    #[test]
+    fn covers_is_directional() {
+        let claim = Target::from_normalized("/a/b");
+        assert!(claim.covers(&Target::from_normalized("/a/b"))); // equal
+        assert!(claim.covers(&Target::from_normalized("/a/b/c/d"))); // claim is ancestor
+        assert!(!claim.covers(&Target::from_normalized("/a"))); // claim is DEEPER: no
+        assert!(!claim.covers(&Target::from_normalized("/a/x"))); // sibling: no
+        assert!(!claim.covers(&Target::from_normalized("/a/bb"))); // prefix-string trap: no
     }
 
     #[test]
