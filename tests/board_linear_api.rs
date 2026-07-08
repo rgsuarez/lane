@@ -72,7 +72,7 @@ fn stdout_json(out: &Output) -> Value {
     })
 }
 
-fn linear_source<'a>(board: &'a Value) -> &'a Value {
+fn linear_source(board: &Value) -> &Value {
     board["sources"]
         .as_array()
         .expect("sources")
