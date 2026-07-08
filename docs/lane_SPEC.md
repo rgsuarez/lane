@@ -54,9 +54,11 @@ claim" convention into a mechanical gate at the commit choke point.
 **Authoritative, local, files (work offline):**
 - Claim records — `~/.lane/<repo>/locks/<lane>.lock` (JSON). SoT for "who holds what on this machine."
 - Audit log — `~/.lane/<repo>/audit.log` (append-only JSONL).
-- Config — `~/.lane/config.toml`.
+- Adapter audit (Slice 4) — `~/.lane/audit.log` (ROOT-level, append-only JSONL: `secret_requested` / `linear_write`, single terminal events). Structurally invisible to core crash-recovery (which only ever opens per-repo audit paths), so an adapter event can never fail-close a core mutation.
+- Publish locks (Slice 4) — `~/.lane/linear-publish/<repo>--<lane>.lock` (adapter-owned advisory locks serializing concurrent gated closeout posts; object-guarded like all state; never the core lane mutex).
+- Config — `~/.lane/config.toml` (Slice 4: read through the same object-guarded reader as claim state, since `[linear] api_url` controls where a resolved credential is SENT; `[secrets.roles]` maps role keys → opaque references; `[linear] cache_ttl_seconds` tunes the read cache).
 
-**Derived / cache (non-authoritative, network-enriched):** worktree registry (`git worktree list`), Linear issue read-cache (TTL'd — **Linear is SoT**), session/heartbeat (overseer join or heartbeat-file mtime).
+**Derived / cache (non-authoritative, network-enriched):** worktree registry (`git worktree list`), Linear issue read-cache (TTL'd, `~/.lane/cache/linear/*.json` — **Linear is SoT**; missing/corrupt/expired silently refetches; never consulted by a trust decision), session/heartbeat (heartbeat-file mtime, if ever built).
 
 **Claim record schema** (ports `zeos-lane` fields + Vantage session concepts):
 ```
@@ -82,7 +84,7 @@ plan_path, claim_status(active|blocked|handoff), session_ref
 ## 7. 1Password integration design
 
 - **Dependency: the `op` CLI** (over the SDK) — zero in-process credential handling, native Touch ID / service-account auth, `op run`/`op read` inject secrets into a child env without printing them, embed-first commodity choice.
-- **Naming (no secret labels in docs/config):** secrets resolved by **logical role keys** in `~/.lane/config.toml` mapped to opaque `op://<vault>/<item>/<field>` references. Store **references, never values, never the human label**. (E.g. a `linear_api` role → an `op://` reference.)
+- **Naming (no secret labels in docs/config):** secrets resolved by **logical role keys** in `~/.lane/config.toml` mapped to opaque `op://<vault>/<item>/<field>` references. Store **references, never values, never the human label**. (E.g. a `linear_api` role → an `op://` reference.) *As built (Slice 4):* provider dispatch is by reference SCHEME — `op://…` spawns the `op` CLI; `env:VARNAME` is the sanctioned env-pointer fallback. `op read --no-newline` under a 60s bounded wait (`op` may block on Touch ID); `--account` passed iff `[secrets] op_account` is set; references pre-spawn validated; `op` stderr classified into a closed vocabulary then DROPPED (it can name vaults/items); values decode strictly, never lossily.
 - **Bootstrap:** `op signin` (Touch ID) for operator sessions, or a **service-account token** via env for headless contexts — never written to disk by `lane`.
 - **Failure mode (fail-closed, offline-safe):** missing `op` / not signed in / missing reference → secret-requiring actions (e.g. Linear writes) fail closed with a clear message; **all local logistics keep working** (they need no secret).
 - **Audit:** `lane` logs a **"secret requested" event (role key + ts, never the value)**; 1Password keeps its own access audit.
@@ -96,7 +98,8 @@ plan_path, claim_status(active|blocked|handoff), session_ref
 - **Identity:** explicit `--instance <journal-stem>` / `LANE_INSTANCE`, never guessed.
 - **Liveness (join, not stored in claim):** lane-owned heartbeat-file mtime, if ever built. `pid` is info-only. (Overseer/tmux liveness descoped 2026-07-08.)
 - **Pairing — PERMANENTLY DESCOPED 2026-07-08** (Commander directive: no tmux, no zeos; zeos retired). The claim record's optional `role` field stays in the schema (additive-evolution law) but nothing sets `advisor`; the 7-var env contract and bootstrap injection are dead. **Session succession is `lane handoff`** (owner-only): flips `claim_status:handoff` + writes a digest — implemented and unaffected.
-- **Audit:** append-only JSONL `{event: claim|renew|release|force|takeover|handoff|secret_requested, lane, linear_key, instance, role, ts}`.
+- **Audit:** append-only JSONL `{event: claim|renew|release|force|takeover|handoff|secret_requested|linear_write, lane, linear_key, instance, role, ts}`. *As built (Slice 4):* `secret_requested` carries the role key in a field named **`secret_role`** (deliberately not `role`, which the claim schema uses for executor|advisor); adapter events live in the ROOT-level `~/.lane/audit.log` (§5).
+- **Claim generation (Slice 4):** the `close` composition binds to `(repo, lane, instance, claimed_at)`. Release is generation-guarded (additive `expected_claimed_at`; a successor claim of the same lane is never released or worktree-stripped by a stale close — the plain `release` verb is unchanged), and gated posts re-verify the generation inside the publish lock before every external write.
 - **Stale/orphan:** `EXPIRED` (past TTL) / `possibly-stale` (active, idle >3h) / `orphaned` (active, no live session) — surfaced by `lane board`; **release always operator-gated**, never auto-stolen.
 - **Commit guard (Slice 3.5):** `lane check` answers "does an ACTIVE claim owned by THIS instance equal-or-ancestor-cover this path?" (read-only, offline, all-namespace scan by default — namespace inference from a worktree's toplevel basename is wrong by construction; identity required, never guessed). `lane hook install` writes a marked pre-commit block into the repo's RESOLVED hooks dir (one install covers all worktrees), composing with — never clobbering — foreign hooks; a managed `core.hooksPath` (husky et al.) is refused with the exact paste-in snippet. Modes via `git config lane.hook.mode`: `advise` (warn, default) / `enforce` (fail closed); `LANE_HOOK_BYPASS=1` is the loud human bypass. The hook never auto-claims and never mutates lane state. Residual: `git commit --no-verify` skips pre-commit — consumer doctrine forbids it for agents; a CI-side backstop is a later slice.
 
@@ -115,6 +118,8 @@ Branch `richie/<team>-N-<slug>` (Linear GitHub-integration format → auto-links
 ## 12. Linear integration + security/privacy
 
 **Linear:** reads free (issues/projects/states/assignees); **status movement via the GitHub integration** (branch/PR-driven, not an agent write); **labels / custom fields / comments = drafted + operator-gated writes**; migration/import = gated batch. No Linear CLI/MCP on general → **net-new thin GraphQL adapter**, API key resolved from **1Password** at call time, never persisted.
+
+*As built (Slice 4):* the adapter (`src/linear/`) rides `ureq` — the crate's ONE allowlisted network dependency (sync-only, rustls, zero async runtime; `tests/no_network_guard.rs` enforces both the manifest allowlist and a source scan proving `src/lock/**` + `src/hook.rs` never import adapter code). Personal keys ride the raw `Authorization` header (no `Bearer`); the transport refuses non-https `api_url` except loopback (test fixtures), classifies HTTP statuses body-free, and bounds every call at 10s. Reads: `lane pull` (viewer's assigned issues, TTL-cached — a fresh cache serves with no secret resolved and no network) and `lane board --linear api` (opt-in, fail-soft, per-key cache; default board touches nothing). The gated write: `lane close --draft-closeout` (pure preview) / `--post-closeout` (the explicit operator go — serialized per-lane publish lock acquired before any secret/mutation; generation re-checks; single preflight resolving the issue UUID + scanning recent comments for the deterministic `lane-closeout: <lane>@<claimed_at>` marker, which dedupes reruns after ambiguous timeouts; comment mutation only this slice — labels/fields ride the same seam later). GraphQL documents use variables exclusively; error bodies are never echoed.
 
 **Never leaves the machine / never posted to Linear:** secret values + 1Password references/labels + retrieval mechanics; raw transcripts / chain-of-thought; journals, memory, pair notes; env values, connection strings, DB fingerprints; customer PII; any gated/unverified state asserted "shipped." Redaction runs before any Linear draft. The tooling performs **no secret-bearing reads** and never echoes a resolved secret.
 
@@ -140,7 +145,7 @@ Full per-surface enumeration with migration mechanics is in
 
 ## 15. Implementation slices (reference)
 
-0a (this doc + the inventory) → 0b doctrine edits (gated) → 1 read-only `lane board` → 2 locking core + offline mode → 3 lane lifecycle (as-built: worktree adapter + `start`/`close`/`handoff`; the pairing/zeos portions of the original Slice 3 name were permanently descoped 2026-07-08) → **3.5 commit-guard adapter (`check` + `hook`, ZER-84)** → 4 Linear read adapter + 1Password + gated writes (scope pinned, ZER-85) → 5 migration tooling + installer. Daemon/dashboard + hard cross-host locking are later embed-first COAs.
+0a (this doc + the inventory) → 0b doctrine edits (gated) → 1 read-only `lane board` → 2 locking core + offline mode → 3 lane lifecycle (as-built: worktree adapter + `start`/`close`/`handoff`; the pairing/zeos portions of the original Slice 3 name were permanently descoped 2026-07-08) → **3.5 commit-guard adapter (`check` + `hook`, ZER-84)** → **4 Linear read adapter + 1Password + gated writes (as-built, ZER-85: `src/config` + `src/secrets` + `src/linear/{transport,api,cache,draft,publish}`, `lane pull`, `board --linear api`, `close --draft-closeout|--post-closeout`, root adapter audit, claim-generation guard)** → 5 migration tooling + installer. Daemon/dashboard + hard cross-host locking are later embed-first COAs.
 
 ## 16. Test strategy
 
