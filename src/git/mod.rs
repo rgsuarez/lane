@@ -19,11 +19,11 @@
 //! so a caller can map it to a refusal rather than a plumbing failure.
 
 use std::fmt;
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 /// Default per-call bounded wait before a hung `git` is killed.
 pub const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -160,69 +160,18 @@ impl GitRunner for StdGitRunner {
     }
 }
 
-/// Spawn a command, drain its pipes on threads, and wait no longer than `timeout` before
-/// killing it. The drainer threads prevent a full pipe buffer from deadlocking the poll
-/// loop, so even a chatty command is captured or cleanly killed.
-fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<GitOutput, GitError> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(GitError::Spawn)?;
-
-    let out_pipe = child.stdout.take();
-    let err_pipe = child.stderr.take();
-    let out_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut p) = out_pipe {
-            let _ = p.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let err_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut p) = err_pipe {
-            let _ = p.read_to_end(&mut buf);
-        }
-        buf
-    });
-
-    let start = Instant::now();
-    let mut backoff = Duration::from_millis(5);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    // Joining after the kill relies on the pipes closing with the child;
-                    // a grandchild holding an inherited pipe could delay this, which is
-                    // pathological for git's own subprocesses and accepted as out of
-                    // threat-model (git spawns no long-lived detached children).
-                    let _ = out_handle.join();
-                    let _ = err_handle.join();
-                    return Err(GitError::Timeout {
-                        secs: timeout.as_secs(),
-                    });
-                }
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_millis(50));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = out_handle.join();
-                let _ = err_handle.join();
-                return Err(GitError::Spawn(e));
-            }
-        }
-    };
-    let stdout = out_handle.join().unwrap_or_default();
-    let stderr = err_handle.join().unwrap_or_default();
+/// Spawn under the shared bounded wait ([`crate::proc::run_bounded`]), decoding output
+/// lossily — git stderr is matched as text and non-UTF-8 is tolerated here (unlike the
+/// secrets adapter, which decodes strictly).
+fn run_bounded(cmd: Command, timeout: Duration) -> Result<GitOutput, GitError> {
+    let out = crate::proc::run_bounded(cmd, timeout).map_err(|e| match e {
+        crate::proc::ProcError::Spawn(e) => GitError::Spawn(e),
+        crate::proc::ProcError::Timeout { secs } => GitError::Timeout { secs },
+    })?;
     Ok(GitOutput {
-        code: status.code(),
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        code: out.code,
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     })
 }
 
@@ -738,6 +687,7 @@ fn path_str(p: &Path) -> Result<&str, GitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn bounded_wait_kills_a_hung_process() {

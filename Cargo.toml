@@ -24,6 +24,10 @@ anyhow = "1"
 # std has no Unicode NFC; this is the single new dependency (Commander-approved).
 # Network-free, no async, no transitive HTTP/DB heft.
 unicode-normalization = "0.1"
+# Slice 4 (ZER-85): $LANE_ROOT/config.toml reader (secret role keys + [linear]
+# settings) in src/config.rs. Parse-only, serde-native, network-free. The locking
+# core never imports it (enforced by the source scan in tests/no_network_guard.rs).
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
