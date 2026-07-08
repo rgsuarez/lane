@@ -792,7 +792,10 @@ fn human_success(
             };
             match outcome {
                 Outcome::Released => format!("closed {lane}{closeout}"),
-                _ => format!("{lane} was not held"),
+                // A closeout may have been posted even when the claim vanished before
+                // release (post succeeds, then an external release races in): still
+                // surface the posted comment so the operator sees the Linear write.
+                _ => format!("{lane} was not held{closeout}"),
             }
         }
         ("close", None) => format!("{lane} was not held"),
@@ -804,9 +807,18 @@ fn human_success(
                 fetched_at,
             }),
         ) => {
+            // Network-sourced text: strip terminal control characters so a crafted
+            // Linear title/state can't inject ANSI escapes or newlines into stdout.
             let mut lines: Vec<String> = issues
                 .iter()
-                .map(|i| format!("{:<11} {:<15} {}", i.identifier, i.state, i.title))
+                .map(|i| {
+                    format!(
+                        "{:<11} {:<15} {}",
+                        crate::model::sanitize_terminal(&i.identifier),
+                        crate::model::sanitize_terminal(&i.state),
+                        crate::model::sanitize_terminal(&i.title)
+                    )
+                })
                 .collect();
             let plural = if issues.len() == 1 { "" } else { "s" };
             lines.push(format!(

@@ -19,8 +19,12 @@ const VIEWER_ISSUES_QUERY: &str = "query($first: Int!) { viewer { assignedIssues
 /// `issues(filter: { team: { key: { eq } }, number: { eq } })` inside this module.
 const ISSUE_BY_KEY_QUERY: &str = "query($key: String!) { issue(id: $key) { identifier title url updatedAt state { name type } assignee { displayName } } }";
 
+// `last: 100` scans the MOST-RECENT comment page: a Linear comment connection is
+// ordered by ascending `createdAt` by default, so `first: 100` would scan the OLDEST
+// 100 and systematically miss a just-posted closeout marker on an issue with 100+
+// comments — defeating the rerun dedupe. `last` returns the newest tail page.
 const PREFLIGHT_ISSUE_QUERY: &str =
-    "query($key: String!) { issue(id: $key) { id comments(first: 100) { nodes { body } } } }";
+    "query($key: String!) { issue(id: $key) { id comments(last: 100) { nodes { body } } } }";
 
 const COMMENT_CREATE_MUTATION: &str = "mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { url } } }";
 

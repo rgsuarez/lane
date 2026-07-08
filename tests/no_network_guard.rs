@@ -79,22 +79,49 @@ fn manifest_declares_no_http_network_deps() {
         );
     }
     for line in manifest.lines() {
-        // A dependency line is `name = "..."` or `name = { ... }`; the key is left of `=`.
-        let key = line.split('=').next().map(str::trim).unwrap_or_default();
+        let trimmed = line.trim();
+        // Inline form: `name = "..."` / `name = { ... }` — key is left of `=`.
+        let key = trimmed.split('=').next().map(str::trim).unwrap_or_default();
+        // Dependency-TABLE form: `[dependencies.tokio]` / `[dev-dependencies.tokio]` —
+        // the banned name is the segment after the last `.` inside the header brackets.
+        let table_dep = trimmed
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .filter(|s| {
+                s.starts_with("dependencies.")
+                    || s.starts_with("dev-dependencies.")
+                    || s.starts_with("build-dependencies.")
+                    || s.contains("-dependencies.")
+            })
+            .and_then(|s| s.rsplit('.').next())
+            .unwrap_or_default();
+        // RENAME form: `alias = { package = "tokio", ... }` — the real crate is the
+        // quoted value of a `package =` key, which the bare-key check above misses.
+        let rename_pkg = trimmed
+            .strip_prefix("package")
+            .map(str::trim_start)
+            .and_then(|s| s.strip_prefix('='))
+            .map(|s| s.trim().trim_matches(['"', ' ']))
+            .unwrap_or_default();
         for dep in FORBIDDEN {
             assert!(
-                key != *dep,
-                "Cargo.toml must not declare the network client dependency `{dep}`"
+                key != *dep && table_dep != *dep && rename_pkg != *dep,
+                "Cargo.toml must not declare the network client dependency `{dep}` \
+                 (checked inline, [dependencies.<name>] table, and package=\"<name>\" rename forms)"
             );
         }
     }
 }
 
-/// The other half of the law: the locking core (`src/lock/**`) and the commit guard
-/// (`src/hook.rs`) never import an adapter module or an adapter-only/network crate.
-/// A plain line scan (comment lines skipped) in the same spirit as the manifest scan.
+/// The other half of the law: no DEFAULT-OFFLINE module imports an adapter module or
+/// an adapter-only/network crate. This covers the locking core (`src/lock/**`) and the
+/// commit guard (`src/hook.rs`) AND the other surfaces that must work with nothing else
+/// up — the git adapter, output rendering, the model, the shared spawn helper, and the
+/// CLI definitions. The legitimate adapter-consumers (`src/linear/**`, `src/secrets/**`,
+/// `src/config.rs`, `src/board/**`, `src/lifecycle.rs`, `src/main.rs`) are excluded by
+/// construction. A plain line scan (comment lines skipped), same spirit as the manifest.
 #[test]
-fn core_sources_import_no_adapter_or_network_code() {
+fn offline_sources_import_no_adapter_or_network_code() {
     const BANNED_TOKENS: &[&str] = &[
         "ureq",
         "crate::linear",
@@ -104,11 +131,17 @@ fn core_sources_import_no_adapter_or_network_code() {
         "use toml",
     ];
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Directory roots whose ENTIRE subtree must stay offline.
     let mut files = rs_files_under(&root.join("src/lock"));
-    files.push(root.join("src/hook.rs"));
+    files.extend(rs_files_under(&root.join("src/git")));
+    files.extend(rs_files_under(&root.join("src/output")));
+    // Individual offline files (their sibling modules are adapter-consumers).
+    for leaf in ["src/hook.rs", "src/model.rs", "src/proc.rs", "src/cli.rs"] {
+        files.push(root.join(leaf));
+    }
     assert!(
-        files.len() > 5,
-        "source scan found suspiciously few core files — walk is broken"
+        files.len() > 8,
+        "source scan found suspiciously few offline files — walk is broken"
     );
     for file in files {
         let text = std::fs::read_to_string(&file)
@@ -121,8 +154,8 @@ fn core_sources_import_no_adapter_or_network_code() {
             for token in BANNED_TOKENS {
                 assert!(
                     !trimmed.contains(token),
-                    "{}:{}: locking core references `{token}` — the core is permanently \
-                     offline and never imports adapter modules or network-capable crates",
+                    "{}:{}: default-offline module references `{token}` — these surfaces are \
+                     permanently offline and never import adapter modules or network-capable crates",
                     file.display(),
                     n + 1
                 );

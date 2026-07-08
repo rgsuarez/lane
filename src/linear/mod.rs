@@ -8,7 +8,7 @@
 //!   async runtime exists anywhere in the tree.
 //! - The API key is resolved through [`crate::secrets`] at call time and rides ONLY
 //!   the `Authorization` header — never disk, logs, envelopes, or errors.
-//! - Linear stays the source of truth: the read cache under `$LANE_ROOT/cache/linear`
+//! - Linear stays the source of truth: the read cache under `$LANE_ROOT/.cache/linear`
 //!   is TTL'd, disposable, derived state that no trust decision ever consults.
 //! - The locking core never imports this module (enforced by the source scan in
 //!   `tests/no_network_guard.rs`); every local verb works with this module unused.

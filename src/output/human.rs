@@ -49,11 +49,17 @@ pub fn render(board: &Board) -> String {
                 None => "-".to_string(),
             };
             // The Linear join (fixture or live): one provenance tag for the issue,
-            // shown on STATE; TITLE is last and deliberately untruncated.
+            // shown on STATE; TITLE is last and deliberately untruncated. State/title
+            // are NETWORK-sourced — strip terminal control chars so a crafted issue
+            // title/state can't inject ANSI escapes or newlines into the board.
             let (issue_state, issue_title) = match &r.linear {
                 Some(p) => (
-                    format!("{}[{}]", p.value.state, prov(p.provenance)),
-                    p.value.title.clone(),
+                    format!(
+                        "{}[{}]",
+                        crate::model::sanitize_terminal(&p.value.state),
+                        prov(p.provenance)
+                    ),
+                    crate::model::sanitize_terminal(&p.value.title),
                 ),
                 None => ("-".to_string(), "-".to_string()),
             };

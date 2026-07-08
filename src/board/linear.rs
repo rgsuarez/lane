@@ -87,7 +87,7 @@ impl LinearProvider for FixtureLinearProvider {
 /// - **Fail-soft**: config/secret/transport failures set `degraded`, land in the
 ///   freshness note (messages are non-secret by construction), and rows still render.
 ///   A transport failure short-circuits further network attempts this run.
-/// - **Cache-backed**: per-key entries under `$LANE_ROOT/cache/linear/` with
+/// - **Cache-backed**: per-key entries under `$LANE_ROOT/.cache/linear/` with
 ///   per-entry TTL; the merged map is written back once (in `freshness`, which the
 ///   board assembles after all joins). A miss (no such issue) is memoized, never
 ///   degraded.
@@ -95,15 +95,23 @@ pub struct ApiLinearProvider {
     root: PathBuf,
     expected_uid: u32,
     ttl_seconds: Cell<u64>,
+    // Config load (no secret, no network) — memoized; gates cache reads.
+    config_attempted: Cell<bool>,
+    config_ok: Cell<bool>,
+    // Secret + transport — resolved LAZILY only on the first cache MISS that needs a
+    // live fetch, so a fully-fresh cache serves with zero secret and zero `op` spawn.
+    secret_attempted: Cell<bool>,
     ctx: RefCell<Option<LiveCtx>>,
-    init_attempted: Cell<bool>,
     by_key: RefCell<BTreeMap<String, cache::CacheEnvelope<LinearIssueLite>>>,
     memo: RefCell<BTreeMap<String, Option<LinearIssueLite>>>,
-    degraded: Cell<bool>,
     notes: RefCell<Vec<String>>,
     fetched: Cell<u32>,
     cache_hits: Cell<u32>,
     dirty_cache: Cell<bool>,
+    // Freshness health. Starts true; set false by a config/secret failure or ANY
+    // per-key fetch error. Never blocks the board or the cache — a soft failure on
+    // one key leaves every other key's fresh cache and successful fetch intact.
+    ok: Cell<bool>,
 }
 
 struct LiveCtx {
@@ -118,20 +126,22 @@ impl ApiLinearProvider {
             root: root.path().to_path_buf(),
             expected_uid: root.expected_uid(),
             ttl_seconds: Cell::new(crate::config::DEFAULT_CACHE_TTL_SECONDS),
+            config_attempted: Cell::new(false),
+            config_ok: Cell::new(false),
+            secret_attempted: Cell::new(false),
             ctx: RefCell::new(None),
-            init_attempted: Cell::new(false),
             by_key: RefCell::new(BTreeMap::new()),
             memo: RefCell::new(BTreeMap::new()),
-            degraded: Cell::new(false),
             notes: RefCell::new(Vec::new()),
             fetched: Cell::new(0),
             cache_hits: Cell::new(0),
             dirty_cache: Cell::new(false),
+            ok: Cell::new(true),
         }
     }
 
-    fn degrade(&self, note: String) {
-        self.degraded.set(true);
+    fn soft_fail(&self, note: String) {
+        self.ok.set(false);
         self.notes.borrow_mut().push(note);
     }
 
@@ -139,23 +149,17 @@ impl ApiLinearProvider {
         cache::cache_dir(&self.root).join(cache::ISSUES_BY_KEY_FILE)
     }
 
-    /// One-shot lazy init: config, by-key cache load, secret resolution (audited to
-    /// the root adapter audit). Returns true iff the live context is ready.
-    fn ensure_ctx(&self, now: DateTime<Utc>) -> bool {
-        if self.degraded.get() {
-            return false;
+    /// Load config + the by-key cache once (NO secret, NO network, NO `op` spawn).
+    /// Memoized. Returns true iff config is usable (so cache reads can be trusted).
+    fn ensure_config(&self) -> bool {
+        if self.config_attempted.get() {
+            return self.config_ok.get();
         }
-        if self.ctx.borrow().is_some() {
-            return true;
-        }
-        if self.init_attempted.get() {
-            return false;
-        }
-        self.init_attempted.set(true);
+        self.config_attempted.set(true);
         let config = match LaneConfig::load(&self.root, self.expected_uid, &StdFs) {
             Ok(c) => c,
             Err(e) => {
-                self.degrade(e.to_string());
+                self.soft_fail(e.to_string());
                 return false;
             }
         };
@@ -165,10 +169,31 @@ impl ApiLinearProvider {
                 *self.by_key.borrow_mut() = map;
             }
         }
+        self.config_ok.set(true);
+        true
+    }
+
+    /// Resolve the secret + build the transport once — called LAZILY, only when a cache
+    /// miss needs a live fetch. A failure is soft (the board still renders every fresh
+    /// cache hit); it just means the missing keys can't be fetched this run. Memoized:
+    /// resolved at most once, so a warm cache never spawns `op`.
+    fn ensure_secret_ctx(&self, now: DateTime<Utc>) -> bool {
+        if self.secret_attempted.get() {
+            return self.ctx.borrow().is_some();
+        }
+        self.secret_attempted.set(true);
+        let config = match LaneConfig::load(&self.root, self.expected_uid, &StdFs) {
+            Ok(c) => c,
+            Err(e) => {
+                self.soft_fail(e.to_string());
+                return false;
+            }
+        };
         let runner = StdOpRunner::new();
-        // `self.root` came from a resolved LaneRoot, so this join equals
-        // `LaneRoot::root_audit_path` (the root-level adapter audit).
-        let sink = StdAuditSink::new(self.root.join("audit.log"), self.expected_uid);
+        let sink = StdAuditSink::new(
+            self.root.join(crate::lock::paths::ROOT_AUDIT_FILE),
+            self.expected_uid,
+        );
         let instance = std::env::var("LANE_INSTANCE")
             .ok()
             .filter(|s| !s.is_empty())
@@ -188,7 +213,7 @@ impl ApiLinearProvider {
         let secret = match result {
             Ok(s) => s,
             Err(e) => {
-                self.degrade(e.to_string());
+                self.soft_fail(e.to_string());
                 return false;
             }
         };
@@ -204,8 +229,10 @@ impl ApiLinearProvider {
         let map = self.by_key.borrow();
         let envelope = map.get(key)?;
         let age = now.signed_duration_since(envelope.fetched_at);
-        let ttl = chrono::Duration::seconds(self.ttl_seconds.get().min(i64::MAX as u64) as i64);
-        if age < chrono::Duration::zero() || age > ttl {
+        // `try_seconds` avoids the panic `Duration::seconds` throws above the
+        // millisecond bound (a huge configured TTL) — None ⇒ effectively unbounded.
+        let ttl = chrono::Duration::try_seconds(self.ttl_seconds.get().min(i64::MAX as u64) as i64);
+        if age < chrono::Duration::zero() || ttl.is_some_and(|ttl| age > ttl) {
             return None;
         }
         Some(envelope.payload.clone())
@@ -220,10 +247,10 @@ impl LinearProvider for ApiLinearProvider {
                 .map(|i| Provenanced::new(i, Provenance::Live));
         }
         let now = Utc::now();
-        // The TTL needs config; load it (and everything else) before the cache read.
-        // A degraded init still allows nothing — cache freshness without config TTL
-        // would be a guess.
-        if !self.ensure_ctx(now) {
+        // Config first (TTL + the by-key cache) — cheap, no secret, no network. Then
+        // try the cache: a fresh hit serves with ZERO secret resolution and ZERO
+        // network, so warm-cache board renders never spawn `op` (mirrors `lane pull`).
+        if !self.ensure_config() {
             return None;
         }
         if let Some(issue) = self.cache_lookup(key, now) {
@@ -233,9 +260,15 @@ impl LinearProvider for ApiLinearProvider {
                 .insert(key.to_string(), Some(issue.clone()));
             return Some(Provenanced::new(issue, Provenance::Live));
         }
+        // Cache miss ⇒ a live fetch is needed; resolve the secret now (lazily, once).
+        // Failure is soft: this key can't be enriched, but other keys' fresh cache and
+        // successful fetches are untouched.
+        if !self.ensure_secret_ctx(now) {
+            return None;
+        }
         let outcome = {
             let ctx = self.ctx.borrow();
-            let ctx = ctx.as_ref().expect("ensure_ctx returned true");
+            let ctx = ctx.as_ref().expect("ensure_secret_ctx returned true");
             api::fetch_issue_by_key(&ctx.transport, &ctx.api_url, &ctx.secret, key)
         };
         match outcome {
@@ -266,7 +299,12 @@ impl LinearProvider for ApiLinearProvider {
                 None
             }
             Err(e) => {
-                self.degrade(e.to_string());
+                // Soft, PER-KEY: a stale/deleted linear_key (Linear reports it via
+                // errors[] → Err, not data.issue=null) marks the source not-ok and
+                // memoizes a miss for THIS key — it never blanks other keys' fresh
+                // cache or successful fetches.
+                self.soft_fail(e.to_string());
+                self.memo.borrow_mut().insert(key.to_string(), None);
                 None
             }
         }
@@ -294,7 +332,7 @@ impl LinearProvider for ApiLinearProvider {
         SourceFreshness {
             source: SourceKind::Linear,
             provenance: Provenance::Live,
-            ok: !self.degraded.get(),
+            ok: self.ok.get(),
             fetched_at: now,
             note,
         }

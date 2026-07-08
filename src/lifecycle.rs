@@ -455,8 +455,24 @@ pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, deps: &CloseDep
             // mutation: a busy loser (`mutex_busy`) and a poisoned lock object (exit 2)
             // both provably touch nothing.
             let publish_guard = publish::acquire(&root, &args.repo, &args.lane, &fs)?;
-            // Step 0.7 — generation re-check #1 (pre-lock races caught here).
-            verify_generation(&lock_path, &root, &fs, &rec, &instance, now)?;
+            // Step 0.7 — generation re-check #1 (pre-lock races caught here). A vanished
+            // claim or a same-instance SUCCESSOR generation (both `NotHeld`) is the same
+            // graceful exit-0 not_held contract as step 0 / the renew race — nothing has
+            // been posted yet, and the successor (if any) is left intact. A foreign
+            // takeover (`NotOwner`) or lapsed lease (`Expired`) stays an honest refusal.
+            match verify_generation(&lock_path, &root, &fs, &rec, &instance, now) {
+                Ok(()) => {}
+                Err(LaneError::Refused(RefusedReason::NotHeld)) => {
+                    let data = close_data(false, false, false, None, None, None, None);
+                    return Ok((Outcome::NotHeld, Some(data), join_warnings(warnings)));
+                }
+                Err(error) => {
+                    return Err(CommandError {
+                        error,
+                        audit_warning: join_warnings(warnings),
+                    });
+                }
+            }
             // Step 0.8 — resolve the API key (audited to the ROOT adapter audit).
             let config = LaneConfig::load(root.path(), root.expected_uid(), &fs)?;
             let root_sink = StdAuditSink::new(root.root_audit_path(), root.expected_uid());
@@ -544,7 +560,15 @@ pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, deps: &CloseDep
                     let data = close_data(false, false, false, None, None, None, None);
                     return Ok((Outcome::NotHeld, Some(data), join_warnings(warnings)));
                 }
-                Err(e) => return Err(e.into()),
+                // Carry the accumulated warnings (post mode may have pushed a
+                // secret_requested audit-degradation warning before this point) —
+                // `e.into()` would hardcode audit_warning: None and drop it.
+                Err(e) => {
+                    return Err(CommandError {
+                        error: e,
+                        audit_warning: join_warnings(warnings),
+                    })
+                }
             };
             warnings.push(renewed.audit_warning);
         }
@@ -731,12 +755,29 @@ pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, deps: &CloseDep
                 // read and Linear committing the create) is irreducible without
                 // cross-host locking — the marker makes such a comment self-identifying
                 // and the generation-guarded release keeps local state truthful.
-                if let Err(error) = verify_generation(&lock_path, &root, &fs, &rec, &instance, now)
-                {
-                    return Err(CommandError {
-                        error,
-                        audit_warning: join_warnings(warnings),
-                    });
+                match verify_generation(&lock_path, &root, &fs, &rec, &instance, now) {
+                    Ok(()) => {}
+                    // Successor/vanished BEFORE any post: graceful not_held (nothing
+                    // published; the successor, if any, is intact). Consistent with the
+                    // step-0/step-0.7/renew races.
+                    Err(LaneError::Refused(RefusedReason::NotHeld)) => {
+                        let data = close_data(
+                            false,
+                            worktree_removed,
+                            skipped_missing,
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                        return Ok((Outcome::NotHeld, Some(data), join_warnings(warnings)));
+                    }
+                    Err(error) => {
+                        return Err(CommandError {
+                            error,
+                            audit_warning: join_warnings(warnings),
+                        });
+                    }
                 }
                 match api::post_comment(
                     deps.transport,
@@ -794,7 +835,37 @@ pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, deps: &CloseDep
             instance,
             expected_claimed_at: Some(rec.claimed_at),
         };
-        let released = release_core(&root, &rel, now, &fs, &sink)?;
+        let released = match release_core(&root, &rel, now, &fs, &sink) {
+            Ok(s) => s,
+            // Generation mismatch at release. With NO external side effect committed
+            // this run (non-post modes, or post mode that only deduped/never posted),
+            // a same-instance successor is the graceful exit-0 not_held contract — the
+            // successor is preserved (release_core refused it), exit code stays 0 so
+            // teardown automation that keys on nonzero is unaffected. But if we DID
+            // post this run, a successor appearing before release is a genuine anomaly
+            // (a closeout is now on Linear for a generation that's gone): surface it as
+            // the error, exit nonzero.
+            Err(LaneError::Refused(RefusedReason::NotHeld))
+                if closeout_posted != Some(true) && closeout_already != Some(true) =>
+            {
+                let data = close_data(
+                    false,
+                    worktree_removed,
+                    skipped_missing,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                return Ok((Outcome::NotHeld, Some(data), join_warnings(warnings)));
+            }
+            Err(error) => {
+                return Err(CommandError {
+                    error,
+                    audit_warning: join_warnings(warnings),
+                });
+            }
+        };
         warnings.push(released.audit_warning);
 
         let outcome = if released.present {
@@ -1333,7 +1404,10 @@ mod tests {
         };
         let args = close_args("demo", "a", root.path());
         let code = run_close_at(&args, Utc::now(), &deps);
-        assert_eq!(code, 1, "refusal, not success");
+        // A same-instance successor detected BEFORE any post is the graceful exit-0
+        // not_held contract (nothing published; the successor is intact) — consistent
+        // with the step-0 / renew races.
+        assert_eq!(code, 0, "graceful not_held, nothing posted");
         assert_eq!(
             transport.creates.load(Ordering::SeqCst),
             0,

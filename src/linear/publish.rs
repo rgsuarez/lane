@@ -20,8 +20,9 @@ use crate::lock::mutex::LaneMutex;
 use crate::lock::paths::{ensure_dir_guarded, LaneRoot};
 use crate::lock::{validate_name, FsOps};
 
-/// Directory under the lane root holding publish-lock files.
-pub const PUBLISH_DIR: &str = "linear-publish";
+/// Directory under the lane root holding publish-lock files. DOT-prefixed so it cannot
+/// collide with a `--repo` directory (`validate_name` rejects non-alphanumeric starts).
+pub const PUBLISH_DIR: &str = ".linear-publish";
 
 /// RAII guard: dropping releases the advisory lock (including on crash).
 pub struct PublishGuard {
@@ -44,9 +45,15 @@ pub fn acquire(
 ) -> Result<PublishGuard, LaneError> {
     validate_name("repo", repo)?;
     validate_name("lane", lane)?;
-    let dir = root.path().join(PUBLISH_DIR);
-    ensure_dir_guarded(&dir, fs, root.expected_uid())?;
-    let path = dir.join(format!("{repo}--{lane}.lock"));
+    // Nest per repo — `<root>/.linear-publish/<repo>/<lane>.lock` — exactly as the core
+    // nests lane locks under per-repo dirs. A flat `{repo}--{lane}.lock` would be
+    // AMBIGUOUS (`-` is legal inside names, so (`a--b`,`c`) and (`a`,`b--c`) collide);
+    // the directory boundary makes each (repo, lane) pair distinct.
+    let base = root.path().join(PUBLISH_DIR);
+    ensure_dir_guarded(&base, fs, root.expected_uid())?;
+    let repo_dir = base.join(repo);
+    ensure_dir_guarded(&repo_dir, fs, root.expected_uid())?;
+    let path = repo_dir.join(format!("{lane}.lock"));
     let mutex = LaneMutex::acquire(&path, fs, root.expected_uid())?;
     Ok(PublishGuard { _mutex: mutex })
 }
@@ -93,6 +100,17 @@ mod tests {
     }
 
     #[test]
+    fn concatenation_ambiguous_pairs_do_not_collide() {
+        // (`ops--api`, `x`) and (`ops`, `api--x`) would map to the same flat
+        // `ops--api--x.lock`; the per-repo nesting keeps them distinct, so holding
+        // one must NOT block the other.
+        let dir = home_tempdir();
+        let root = root_at(dir.path());
+        let _a = acquire(&root, "ops--api", "x", &StdFs).expect("a");
+        let _b = acquire(&root, "ops", "api--x", &StdFs).expect("b (must not collide)");
+    }
+
+    #[test]
     fn symlinked_publish_dir_fails_closed() {
         let dir = home_tempdir();
         let root = root_at(dir.path());
@@ -107,10 +125,10 @@ mod tests {
     fn symlinked_lock_file_fails_closed() {
         let dir = home_tempdir();
         let root = root_at(dir.path());
-        let pubdir = dir.path().join(PUBLISH_DIR);
-        std::fs::create_dir_all(&pubdir).unwrap();
+        let repo_dir = dir.path().join(PUBLISH_DIR).join("ops");
+        std::fs::create_dir_all(&repo_dir).unwrap();
         std::fs::write(dir.path().join("target"), "x").unwrap();
-        symlink(dir.path().join("target"), pubdir.join("ops--demo.lock")).unwrap();
+        symlink(dir.path().join("target"), repo_dir.join("demo.lock")).unwrap();
         let err = acquire(&root, "ops", "demo", &StdFs).expect_err("must fail closed");
         assert_eq!(err.exit_code(), 2);
     }

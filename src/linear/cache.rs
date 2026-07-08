@@ -1,5 +1,5 @@
 //! TTL'd Linear read cache — DERIVED, DISPOSABLE, NON-AUTHORITATIVE state under
-//! `$LANE_ROOT/cache/linear/`.
+//! `$LANE_ROOT/.cache/linear/`.
 //!
 //! Boundary with the guarded reader: `record::read_guarded` is the trust boundary
 //! for state that gates mutations; this cache is disposable derived data whose worst
@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Duration, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-/// Cache directory under the lane root.
-pub const CACHE_DIR: &str = "cache/linear";
+/// Cache directory under the lane root. DOT-prefixed so it cannot collide with a
+/// `--repo` directory (`validate_name` rejects names starting with a non-alphanumeric).
+pub const CACHE_DIR: &str = ".cache/linear";
 /// The `lane pull` viewer-issues cache file.
 pub const VIEWER_ISSUES_FILE: &str = "viewer-issues.json";
 /// The board issues-by-key cache file.
@@ -44,8 +45,12 @@ pub fn read_fresh<T: DeserializeOwned>(
     let text = fs::read_to_string(path).ok()?;
     let envelope: CacheEnvelope<T> = serde_json::from_str(&text).ok()?;
     let age = now.signed_duration_since(envelope.fetched_at);
-    let ttl = Duration::seconds(ttl_seconds.min(i64::MAX as u64) as i64);
-    if age < Duration::zero() || age > ttl {
+    // `Duration::seconds` PANICS above i64::MAX/1000 (TimeDelta is bounded in
+    // milliseconds), so a huge configured TTL (e.g. i64::MAX as a "never expire"
+    // value) must not reach it. `try_seconds` returns None past the bound; treat
+    // that as an effectively unbounded TTL (never expired on the age side).
+    let ttl = Duration::try_seconds(ttl_seconds.min(i64::MAX as u64) as i64);
+    if age < Duration::zero() || ttl.is_some_and(|ttl| age > ttl) {
         return None;
     }
     Some(envelope)
@@ -106,6 +111,22 @@ mod tests {
         // Future timestamp (clock skew / tamper): refetch.
         let earlier = now - Duration::seconds(10);
         assert!(read_fresh::<Vec<String>>(&path, 300, earlier).is_none());
+    }
+
+    #[test]
+    fn huge_ttl_does_not_panic() {
+        // A "never expire" TTL like i64::MAX must NOT panic Duration::seconds (its
+        // bound is i64::MAX *milliseconds*). It reads as effectively unbounded: a
+        // just-written entry stays fresh.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.json");
+        let now = Utc::now();
+        assert!(write(&path, &vec!["x".to_string()], now).is_none());
+        let hit = read_fresh::<Vec<String>>(&path, u64::MAX, now);
+        assert!(
+            hit.is_some(),
+            "huge TTL must be treated as unbounded, not panic"
+        );
     }
 
     #[test]

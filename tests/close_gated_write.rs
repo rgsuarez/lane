@@ -200,7 +200,7 @@ fn post_closeout_full_flow() {
 
     // Lane released; audit trail on both files; secret nowhere.
     assert!(!root.path().join("ops/locks/zer-2.lock").exists());
-    let root_audit = fs::read_to_string(root.path().join("audit.log")).unwrap();
+    let root_audit = fs::read_to_string(root.path().join(".adapter-audit.log")).unwrap();
     assert!(root_audit.contains("\"event\":\"secret_requested\""));
     assert!(root_audit.contains("\"event\":\"linear_write\""));
     assert!(root_audit.contains("\"linear_key\":\"ZER-2\""));
@@ -265,7 +265,7 @@ fn post_failure_keeps_claim_and_rerun_dedupes_a_committed_comment() {
         root.path().join("ops/locks/zer-3.lock").exists(),
         "claim held after the failed post — rerunnable"
     );
-    let root_audit = fs::read_to_string(root.path().join("audit.log")).unwrap();
+    let root_audit = fs::read_to_string(root.path().join(".adapter-audit.log")).unwrap();
     assert!(
         root_audit.contains("\"event\":\"linear_write\"")
             && root_audit.contains("\"outcome\":\"error\""),

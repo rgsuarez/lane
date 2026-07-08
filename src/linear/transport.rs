@@ -75,18 +75,25 @@ fn check_url_policy(url: &str) -> Result<(), TransportError> {
         return Ok(());
     }
     if let Some(rest) = url.strip_prefix("http://") {
-        let authority = rest.split('/').next().unwrap_or("");
-        let host = if let Some(v6) = authority.strip_prefix('[') {
-            // Bracketed IPv6 authority: compare the bracketed host.
-            match v6.split(']').next() {
-                Some(h) => format!("[{h}]"),
-                None => authority.to_string(),
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        // Reject ANY userinfo (`user[:pass]@host`) outright. ureq/`http` derive the
+        // connect host as the substring AFTER the last `@`, so a value like
+        // `http://127.0.0.1:1@evil.com/` would otherwise let a loopback token in the
+        // USERINFO pass this check while the key is shipped cleartext to `evil.com`.
+        // A genuine loopback authority never carries userinfo, so `@` ⇒ fail closed.
+        if !authority.contains('@') {
+            let host = if let Some(v6) = authority.strip_prefix('[') {
+                // Bracketed IPv6 authority: compare the bracketed host.
+                match v6.split(']').next() {
+                    Some(h) => format!("[{h}]"),
+                    None => authority.to_string(),
+                }
+            } else {
+                authority.split(':').next().unwrap_or("").to_string()
+            };
+            if host == "127.0.0.1" || host == "localhost" || host == "[::1]" {
+                return Ok(());
             }
-        } else {
-            authority.split(':').next().unwrap_or("").to_string()
-        };
-        if host == "127.0.0.1" || host == "localhost" || host == "[::1]" {
-            return Ok(());
         }
     }
     Err(TransportError::UrlPolicy(
@@ -127,18 +134,20 @@ impl LinearTransport for UreqTransport {
             .send(payload.as_str())
             .map_err(|e| TransportError::Network(e.to_string()))?;
         let status = resp.status().as_u16();
-        let text = resp
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| TransportError::Network(format!("reading response: {e}")))?;
+        // Classify the status BEFORE touching the body: a non-2xx response with a
+        // non-UTF-8 or over-limit body must still surface its actionable per-status
+        // hint, not get misreported as a generic transport/network error. Error
+        // bodies are never read, classified from, stored, or surfaced.
         if !(200..300).contains(&status) {
-            // `text` is deliberately dropped unread past this point: error bodies are
-            // never classified from, stored, or surfaced.
             return Err(TransportError::Http {
                 status,
                 hint: hint_for(status),
             });
         }
+        let text = resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| TransportError::Network(format!("reading response: {e}")))?;
         serde_json::from_str(&text)
             .map_err(|e| TransportError::Malformed(format!("response is not JSON: {e}")))
     }
@@ -183,6 +192,20 @@ mod tests {
             check_url_policy("http://localhost.evil.example/x"),
             Err(TransportError::UrlPolicy(_))
         ));
+        // Userinfo tricks: a loopback token in the USERINFO must NOT pass — ureq
+        // connects to the post-`@` host, so these would ship the key to `evil.com`.
+        for evil in [
+            "http://127.0.0.1@evil.com/graphql",
+            "http://127.0.0.1:1@evil.com/graphql",
+            "http://localhost:1@evil.com/graphql",
+            "http://[::1]@evil.com/graphql",
+            "http://[::1]:5@evil.com/graphql",
+        ] {
+            assert!(
+                matches!(check_url_policy(evil), Err(TransportError::UrlPolicy(_))),
+                "userinfo bypass not rejected: {evil}"
+            );
+        }
     }
 
     #[test]

@@ -94,13 +94,13 @@ fn pull_live_fetch_envelope_and_wire_facts() {
     );
 
     // The root adapter audit recorded the request — role key only.
-    let audit = fs::read_to_string(root.path().join("audit.log")).expect("root audit");
+    let audit = fs::read_to_string(root.path().join(".adapter-audit.log")).expect("root audit");
     assert!(audit.contains("\"event\":\"secret_requested\""));
     assert!(audit.contains("\"secret_role\":\"linear_api\""));
     assert!(!audit.contains(KEY_SENTINEL));
 
     // The cache was written.
-    let cache = fs::read_to_string(root.path().join("cache/linear/viewer-issues.json"))
+    let cache = fs::read_to_string(root.path().join(".cache/linear/viewer-issues.json"))
         .expect("cache written");
     assert!(cache.contains("ZER-85"));
     assert!(!cache.contains(KEY_SENTINEL), "key leaked into the cache");
@@ -111,7 +111,7 @@ fn pull_serves_fresh_cache_with_no_secret_and_no_network() {
     let root = common::temp_root();
     // Unroutable-by-policy api_url + NO key env var: any live path would fail loudly.
     write_config(root.path(), "http://127.0.0.1:9/graphql");
-    let cache_dir = root.path().join("cache/linear");
+    let cache_dir = root.path().join(".cache/linear");
     fs::create_dir_all(&cache_dir).unwrap();
     let envelope = json!({
         "fetched_at": chrono::Utc::now().to_rfc3339(),
@@ -139,7 +139,7 @@ fn pull_refresh_bypasses_cache_and_rewrites_it() {
     let root = common::temp_root();
     let (url, server) = common::serve_http(vec![("200 OK", viewer_response("ZER-9", "fresh"))]);
     write_config(root.path(), &url);
-    let cache_dir = root.path().join("cache/linear");
+    let cache_dir = root.path().join(".cache/linear");
     fs::create_dir_all(&cache_dir).unwrap();
     let stale = json!({
         "fetched_at": chrono::Utc::now().to_rfc3339(),
@@ -168,7 +168,7 @@ fn pull_expired_and_corrupt_cache_refetch() {
         let root = common::temp_root();
         let (url, server) = common::serve_http(vec![("200 OK", viewer_response("ZER-2", "live"))]);
         write_config(root.path(), &url);
-        let cache_dir = root.path().join("cache/linear");
+        let cache_dir = root.path().join(".cache/linear");
         fs::create_dir_all(&cache_dir).unwrap();
         let content = match seed {
             "expired" => json!({
@@ -193,7 +193,7 @@ fn pull_smaller_limit_serves_cache_larger_limit_refetches() {
     let root = common::temp_root();
     let (url, server) = common::serve_http(vec![("200 OK", viewer_response("ZER-3", "live"))]);
     write_config(root.path(), &url);
-    let cache_dir = root.path().join("cache/linear");
+    let cache_dir = root.path().join(".cache/linear");
     fs::create_dir_all(&cache_dir).unwrap();
     let cached = json!({
         "fetched_at": chrono::Utc::now().to_rfc3339(),
@@ -264,5 +264,30 @@ fn pull_human_lines() {
     );
     assert!(text.contains("(1 issue, api, fetched "), "tail: {text}");
     assert!(!text.contains(KEY_SENTINEL));
+    let _ = server.join();
+}
+
+#[test]
+fn pull_human_output_strips_control_chars_from_network_titles() {
+    let root = common::temp_root();
+    // A hostile issue title carrying an ANSI escape + an embedded newline.
+    let evil_title = "pwn\u{1b}[2K\nZER-999  Done  spoofed";
+    let (url, server) = common::serve_http(vec![("200 OK", viewer_response("ZER-7", evil_title))]);
+    write_config(root.path(), &url);
+
+    let out = run_pull(root.path(), &[], Some(KEY_SENTINEL));
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains('\u{1b}'),
+        "ANSI escape reached the terminal: {text:?}"
+    );
+    // One issue line + the summary tail = exactly 2 lines; the embedded newline must
+    // NOT have split the title into a spoofed extra row.
+    assert_eq!(
+        text.trim_end().lines().count(),
+        2,
+        "embedded newline injected an extra row: {text:?}"
+    );
     let _ = server.join();
 }

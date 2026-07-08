@@ -213,3 +213,116 @@ fn linear_api_without_keys_never_initializes() {
         .unwrap()
         .contains("0 fetched, 0 cached"));
 }
+
+#[test]
+fn linear_api_serves_fresh_cache_with_op_absent() {
+    let root = common::temp_root();
+    // A fresh by-key cache entry + config; NO key env var and `op` absent from PATH.
+    // The row must enrich from cache alone — no secret resolved, no network — mirroring
+    // `lane pull`'s cached-offline behavior.
+    write_config(root.path(), "http://127.0.0.1:9/graphql");
+    claim_with_key(root.path(), "ops", "zer-cached", Some("ZER-CACHED"));
+    let cache_dir = root.path().join(".cache/linear");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let by_key = json!({
+        "ZER-CACHED": {
+            "fetched_at": chrono::Utc::now().to_rfc3339(),
+            "payload": {
+                "key": "ZER-CACHED", "title": "from cache", "state": "In Review",
+                "assignee": "Richie Suarez", "url": "https://linear.app/x/ZER-CACHED"
+            }
+        }
+    });
+    fs::write(cache_dir.join("issues-by-key.json"), by_key.to_string()).unwrap();
+    let empty_path = tempfile::tempdir().expect("empty dir");
+
+    let out = run_board(
+        root.path(),
+        &["--json", "--linear", "api"],
+        &[("PATH", empty_path.path().to_str().unwrap())],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let board = stdout_json(&out);
+    let linear = &board["rows"][0]["linear"];
+    assert_eq!(
+        linear["value"]["title"],
+        json!("from cache"),
+        "cache served the row"
+    );
+    assert_eq!(linear["value"]["state"], json!("In Review"));
+    let src = linear_source(&board);
+    assert_eq!(
+        src["ok"],
+        json!(true),
+        "cache hit ⇒ healthy, no secret needed"
+    );
+    assert!(
+        src["note"]
+            .as_str()
+            .unwrap()
+            .contains("0 fetched, 1 cached"),
+        "note: {}",
+        src["note"]
+    );
+    // The root adapter audit must NOT exist — no secret was ever resolved.
+    assert!(
+        !root.path().join(".adapter-audit.log").exists(),
+        "a secret was resolved despite a fresh cache hit"
+    );
+}
+
+#[test]
+fn linear_api_one_stale_key_does_not_blank_a_fresh_cached_key() {
+    let root = common::temp_root();
+    // Two claims: one has a fresh cache entry, the other's key errors at the API.
+    // The stale key must NOT blank the cached key (per-key soft failure).
+    let (url, server) = common::serve_http(vec![(
+        "200 OK",
+        json!({ "errors": [ { "message": "Entity not found: Issue" } ], "data": null }).to_string(),
+    )]);
+    write_config(root.path(), &url);
+    claim_with_key(root.path(), "ops", "aaa-cached", Some("ZER-CACHED"));
+    claim_with_key(root.path(), "ops", "zzz-stale", Some("ZER-STALE"));
+    let cache_dir = root.path().join(".cache/linear");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let by_key = json!({
+        "ZER-CACHED": {
+            "fetched_at": chrono::Utc::now().to_rfc3339(),
+            "payload": { "key": "ZER-CACHED", "title": "cached row", "state": "Done",
+                "assignee": null, "url": "https://x" }
+        }
+    });
+    fs::write(cache_dir.join("issues-by-key.json"), by_key.to_string()).unwrap();
+
+    let out = run_board(
+        root.path(),
+        &["--json", "--linear", "api"],
+        &[(KEY_ENV_VAR, "board-key")],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let board = stdout_json(&out);
+    // Rows sort by linear_key; find the cached one and confirm it enriched despite the
+    // sibling key's API error.
+    let rows = board["rows"].as_array().unwrap();
+    let cached = rows
+        .iter()
+        .find(|r| r["linear_key"]["value"] == json!("ZER-CACHED"))
+        .expect("cached row present");
+    assert_eq!(
+        cached["linear"]["value"]["title"],
+        json!("cached row"),
+        "the fresh cached key was blanked by an unrelated key's error"
+    );
+    let src = linear_source(&board);
+    assert_eq!(
+        src["ok"],
+        json!(false),
+        "the stale key marks the source not-ok"
+    );
+    let _ = server.join();
+}
