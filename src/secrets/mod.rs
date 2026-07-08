@@ -46,6 +46,13 @@ pub const UNSCOPED: &str = "-";
 pub struct SecretValue(String);
 
 impl SecretValue {
+    /// Wrap an already-resolved secret (the resolution paths and test fixtures).
+    /// The value discipline — never log, echo, serialize, or persist — applies from
+    /// this point on.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
     /// The raw secret. Call ONLY at the point of consumption; never log/echo/store.
     pub fn expose(&self) -> &str {
         &self.0

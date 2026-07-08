@@ -13,6 +13,7 @@ pub mod error;
 pub mod git;
 pub mod hook;
 pub mod lifecycle;
+pub mod linear;
 pub mod lock;
 pub mod model;
 pub mod output;

@@ -21,18 +21,24 @@ fn default_linear_provider_is_offline() {
 /// locking core. Each entry carries its justification; the source scan below pins
 /// where they may be imported. Growing this list is a DELIBERATE act (Slice-gated,
 /// justified in Cargo.toml and here).
-const ADAPTER_ONLY: &[(&str, &str)] = &[(
-    "toml",
-    "Slice 4 (ZER-85): $LANE_ROOT/config.toml parsing for src/config.rs; parse-only, serde-native, network-free",
-)];
+const ADAPTER_ONLY: &[(&str, &str)] = &[
+    (
+        "toml",
+        "Slice 4 (ZER-85): $LANE_ROOT/config.toml parsing for src/config.rs; parse-only, serde-native, network-free",
+    ),
+    (
+        "ureq",
+        "Slice 4 (ZER-85): sync-only HTTP for src/linear; blocking client, zero async runtime in its tree, rustls; importable ONLY outside the locking core",
+    ),
+];
 
 /// Never allowed anywhere in the manifest: HTTP clients (other than an ADAPTER_ONLY
 /// grant), async runtimes, embedded DBs, raw-syscall shims.
 const FORBIDDEN: &[&str] = &[
-    // HTTP / network
+    // HTTP / network (ureq moved to ADAPTER_ONLY in Slice 4 — the deliberate,
+    // justified amendment; everything else here stays banned crate-wide)
     "reqwest",
     "hyper",
-    "ureq",
     "graphql_client",
     "isahc",
     "surf",

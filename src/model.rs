@@ -174,6 +174,20 @@ pub struct LinearIssueLite {
     pub url: String,
 }
 
+/// One pulled Linear issue (Slice 4, `lane pull`). ADAPTER-NEUTRAL on purpose:
+/// defined here — not in `src/linear` — so the envelope layer (`src/lock`) can carry
+/// it in `VerbData::Pull` without referencing the adapter (the core source-scan law
+/// in `tests/no_network_guard.rs`). The adapter deserializes GraphQL straight into it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullIssue {
+    pub identifier: String,
+    pub title: String,
+    pub state: String,
+    pub state_type: String,
+    pub url: String,
+    pub updated_at: String,
+}
+
 /// One board row, keyed by Linear issue where available. Every claim-sourced fact
 /// is provenance-tagged: claim facts are authoritative; `age_secs` and `stale_state`
 /// are derived; provider facts carry the provider's provenance.
