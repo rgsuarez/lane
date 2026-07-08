@@ -4,7 +4,6 @@
 //! POST + JSON content type, status classification without body echo, and the
 //! bounded timeout.
 
-use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,58 +12,10 @@ use lane::linear::transport::{linear_to_lane, LinearTransport, TransportError, U
 use lane::secrets::SecretValue;
 use serde_json::json;
 
-/// Serve exactly one request: capture it fully (headers + Content-Length body),
-/// respond with `status_line` + `body`, and return the raw captured request text.
-fn serve_once(
-    status_line: &'static str,
-    body: &'static str,
-) -> (String, thread::JoinHandle<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-    let addr = listener.local_addr().expect("addr");
-    let url = format!("http://{addr}/graphql");
-    let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let raw = read_full_request(&mut stream);
-        let response = format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write response");
-        raw
-    });
-    (url, handle)
-}
+mod common;
 
-/// Read one HTTP/1.1 request: headers to CRLFCRLF, then Content-Length body bytes.
-fn read_full_request(stream: &mut std::net::TcpStream) -> String {
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let header_end = loop {
-        let n = stream.read(&mut chunk).expect("read request");
-        assert!(n > 0, "client closed before sending a full request");
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
-            break pos + 4;
-        }
-    };
-    let headers = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
-    let content_length: usize = headers
-        .lines()
-        .find_map(|l| l.strip_prefix("content-length:"))
-        .map(|v| v.trim().parse().expect("content-length"))
-        .unwrap_or(0);
-    while buf.len() < header_end + content_length {
-        let n = stream.read(&mut chunk).expect("read body");
-        assert!(n > 0, "client closed mid-body");
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    String::from_utf8_lossy(&buf).into_owned()
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+fn serve_once(status_line: &'static str, body: &str) -> (String, thread::JoinHandle<Vec<String>>) {
+    common::serve_http(vec![(status_line, body.to_string())])
 }
 
 #[test]
@@ -77,7 +28,7 @@ fn ureq_transport_posts_graphql_with_raw_authorization() {
         .expect("round trip");
     assert_eq!(resp.pointer("/data/ok"), Some(&json!(true)));
 
-    let raw = server.join().expect("server thread");
+    let raw = server.join().expect("server thread").remove(0);
     let lower = raw.to_lowercase();
     assert!(lower.starts_with("post /graphql http/1.1"), "raw: {raw}");
     assert!(
@@ -127,7 +78,7 @@ fn silent_server_hits_the_bounded_timeout() {
     // timeout (generous margins, not a tight window — the ZER-83 anti-pattern).
     let _server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
-        let _ = read_full_request(&mut stream);
+        let _ = common::read_full_request(&mut stream);
         thread::sleep(Duration::from_secs(5));
     });
     let transport = UreqTransport::with_timeout(Duration::from_millis(300));

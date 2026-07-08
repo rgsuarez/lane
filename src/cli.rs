@@ -48,6 +48,9 @@ pub enum Command {
     Status(StatusArgs),
     /// Read-only listing of claims (all namespaces, or one `--repo`).
     List(ListArgs),
+    /// List your assigned Linear issues (read-only network verb; TTL-cached; API key
+    /// resolved via 1Password `op` at call time, never persisted).
+    Pull(PullArgs),
     /// Read-only coverage verdict: does an active claim owned by this instance cover a
     /// path? (exit 0 covered; 1 refused: uncovered | foreign_owner | no_identity).
     Check(CheckArgs),
@@ -239,6 +242,24 @@ pub struct StatusArgs {
 pub struct ListArgs {
     #[arg(long)]
     pub repo: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub lane_root: Option<PathBuf>,
+}
+
+/// `lane pull [--limit N] [--refresh] [--json]` — the viewer's assigned Linear issues.
+/// Identity-free (the API key IS the viewer) and repo-less; needs only `$LANE_ROOT`
+/// for config + cache. A fresh cache serves with no secret resolved and no network
+/// touched; `--refresh` bypasses the cache read (and rewrites it on success).
+#[derive(Args, Debug)]
+pub struct PullArgs {
+    /// Maximum issues to list (Linear page cap 250).
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=250))]
+    pub limit: u32,
+    /// Bypass the read cache and fetch fresh.
+    #[arg(long)]
+    pub refresh: bool,
     #[arg(long)]
     pub json: bool,
     #[arg(long)]

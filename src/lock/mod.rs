@@ -522,6 +522,14 @@ pub(crate) enum VerbData {
     List {
         rows: Vec<StatusData>,
     },
+    // Slice 4: `lane pull`. Carries the ADAPTER-NEUTRAL `model::PullIssue` DTO — this
+    // module never references `crate::linear` (the core source-scan law); the adapter
+    // constructs the variant and emits through the same single-envelope path.
+    Pull {
+        issues: Vec<crate::model::PullIssue>,
+        source: &'static str,
+        fetched_at: DateTime<Utc>,
+    },
     Check {
         path: String,
         repo: String,
@@ -743,6 +751,26 @@ fn human_success(
             _ => format!("{lane} was not held"),
         },
         ("close", None) => format!("{lane} was not held"),
+        (
+            "pull",
+            Some(VerbData::Pull {
+                issues,
+                source,
+                fetched_at,
+            }),
+        ) => {
+            let mut lines: Vec<String> = issues
+                .iter()
+                .map(|i| format!("{:<11} {:<15} {}", i.identifier, i.state, i.title))
+                .collect();
+            let plural = if issues.len() == 1 { "" } else { "s" };
+            lines.push(format!(
+                "({} issue{plural}, {source}, fetched {})",
+                issues.len(),
+                fetched_at.to_rfc3339()
+            ));
+            lines.join("\n")
+        }
         ("status", Some(VerbData::Status(sd))) => {
             if sd.present {
                 let ss = sd
@@ -889,7 +917,7 @@ fn human_success(
 
 use crate::cli::{CheckArgs, ClaimArgs, HandoffArgs, ListArgs, ReleaseArgs, RenewArgs, StatusArgs};
 
-fn home_env() -> Option<String> {
+pub(crate) fn home_env() -> Option<String> {
     std::env::var("HOME").ok()
 }
 
