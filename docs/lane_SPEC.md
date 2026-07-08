@@ -11,18 +11,18 @@
 
 ## 1. North star
 
-A **portable, Linear-first, offline-capable local agent-work orchestration app**. **Linear** is the planning source of truth, **GitHub** is the code/CI/review SoT, **1Password** is the secret provider, and **`lane`** owns the machine-local logistics those three do not: lane claims, worktree coordination, active session/heartbeat visibility, advisor/executor pairing, audit history, Git discipline, gates, and closeout. The core **works fully offline**; network services only enrich planning and closeout.
+A **portable, Linear-first, offline-capable local agent-work orchestration app**. **Linear** is the planning source of truth, **GitHub** is the code/CI/review SoT, **1Password** is the secret provider, and **`lane`** owns the machine-local logistics those three do not: lane claims, worktree coordination, active session/heartbeat visibility, commit-time coverage enforcement, audit history, Git discipline, gates, and closeout. The core **works fully offline**; network services only enrich planning and closeout. *(Advisor/executor pairing, tmux, and zeos integration were permanently descoped 2026-07-08 — Commander directive; zeos is retired.)*
 
 ## 2. Product boundary
 
-**Standalone local app**, own repo (`~/projects-local/lane`), **separate from zeos**, callable by zeos via a skill-wrap. Not a zeos subcomponent, not a Vantage module, not a hybrid. Rationale: separation of concerns (it is the local successor to Vantage's *lane/session runtime* only — planning→Linear, secrets→1Password); portability (one native binary, env-overridable root); offline-first reliability (claims must work with nothing else up); clean zeos integration via the proven skill-wraps-CLI pattern.
+**Standalone local app**, own repo (`~/projects-local/lane`), **invoked directly by agent sessions** (Claude Code et al.) — no wrapper layer, no skill layer (zeos retired 2026-07). Not a Vantage module, not a hybrid. Rationale: separation of concerns (it is the local successor to Vantage's *lane/session runtime* only — planning→Linear, secrets→1Password); portability (one native binary, env-overridable root); offline-first reliability (claims must work with nothing else up); zero integration dependencies (a plain CLI + a git hook is the whole consumption surface).
 
 ## 3. Name, runtime, install
 
 - **Name:** `lane`. **Config/state root:** `~/.lane/` with **`LANE_ROOT`** env override (absolute-only; test isolation + portability).
 - **Runtime:** **Rust**, shipped as a **single native CLI binary** (self-contained; macOS does not support fully static libSystem linking — "native self-contained," not "static"). Chosen for: no `node_modules` cross-platform landmine, fast startup for a hot CLI, first-class atomic file-locking/concurrency.
 - **No daemon** (MVP). Claims are files; liveness is read at query time; the board is a read-time aggregator. A daemon/dashboard is a later embed-first COA only.
-- **Install:** `general` first (`cargo install --path .` or copied binary on PATH) + a zeos `skills/lane/SKILL.md` wrapper. Later: copy the binary to liquid/others; per-host `LANE_ROOT`; **GitHub remote deferred** (decided before the installer slice).
+- **Install:** `general` first (`cargo install --path .` or copied binary on PATH); consumed directly as a CLI + git pre-commit hook. Later: copy the binary to liquid/others; per-host `LANE_ROOT`; **GitHub remote deferred** (decided before the installer slice).
 
 ## 4. CLI surface
 
@@ -30,7 +30,7 @@ A **portable, Linear-first, offline-capable local agent-work orchestration app**
 lane board     # read-only issue-keyed aggregate (Linear + worktrees + claims + liveness)
 lane pull      # list assigned Linear issues to choose from (read-only)
 lane plan      # record plan_path for a lane
-lane start     # create branch+worktree + claim + register pair (gated git steps)
+lane start     # create branch+worktree + claim (gated git steps)
 lane claim     # atomic claim of a lane (offline-capable)
 lane renew     # extend a held claim (owner-only)
 lane release   # release a held claim (owner-only)
@@ -38,12 +38,12 @@ lane status    # read-only status of one lane (--json)
 lane list      # read-only listing of claims (all namespaces, or one --repo)
 lane check     # read-only: does an active caller-owned claim cover a path? (Slice 3.5)
 lane hook      # git pre-commit guard: print|install|status|uninstall (Slice 3.5)
-lane pair      # attach advisor to executor (same Linear key)
 lane handoff   # flip claim_status:handoff + write digest
 lane close     # release + draft Linear closeout (gated write)
 lane migrate   # Vantage-LOE → Linear, archive-first (gated batch)
 ```
 Verbs mirror the proven `vantage lane` + `zeos-lane` vocabulary. `--json` on all read verbs.
+(`lane pair` was removed from the plan 2026-07-08: pairing/tmux/zeos permanently descoped.)
 `hook` is lane's first commit-time-enforcement surface (a deliberate Slice 3.5 boundary
 expansion, ZER-84): the installed pre-commit hook runs `lane check` and — in `enforce`
 mode — refuses an uncovered commit fail-closed, converting the "first agent needs no
@@ -74,10 +74,10 @@ plan_path, claim_status(active|blocked|handoff), session_ref
 | **Linear** | Issues/Projects/Initiatives, status, assignee, labels, planning comments | **Planning** |
 | **GitHub** | Branches, PRs, CI, reviews, releases | **Code / CI / review / deploy** |
 | **1Password** | Secret storage + retrieval (`op`) | **Secrets** |
-| **`lane`** | Claims, worktree registry, session/heartbeat, pairing, gates, closeout, local audit | **Machine-local logistics** |
-| **zeos** | Kernel/profile identity, journals, memory; skill-wrap calling `lane` | **Callable operator OS / memory wrapper** |
+| **`lane`** | Claims, worktree registry, session/heartbeat, commit guard, gates, closeout, local audit | **Machine-local logistics** |
 | **Vantage (homebox)** | Historical LOE archive; migration source; design reference | **Legacy archive / optional unrelated ops only** |
-| **overseer (optional)** | Pair registry, heartbeats — single host | **Liveness join (per host)** |
+
+*(zeos and overseer rows removed 2026-07-08: zeos is retired; overseer is tmux-based and descoped with it. Operator memory/journals live with the agent tooling; liveness, if ever built, is lane-owned heartbeat files.)*
 
 ## 7. 1Password integration design
 
@@ -94,15 +94,15 @@ plan_path, claim_status(active|blocked|handoff), session_ref
 - **Target/worktree overlap:** path-canonical (NFC, case-fold, symlink realpath), ancestor/descendant refusal, app-level mutex. Worktree path is the target.
 - **TTL/renew/release:** hours-scale (default 12); owner-only renew/release; never auto-steal an active lane; race-safe expiry takeover under a per-lane mutex; `--force` operator override (logged).
 - **Identity:** explicit `--instance <journal-stem>` / `LANE_INSTANCE`, never guessed.
-- **Liveness (join, not stored in claim):** overseer `get_worker_heartbeats` if present, else heartbeat-file mtime + tmux check. `pid` is info-only.
-- **Pair/advisor (ported from Vantage):** `role:executor|advisor` on the claim; advisor references the same Linear key; 7-var env contract + bootstrap-markdown injection; active-parent doctrine (advisor refuses a non-active parent); handoff flips `claim_status:handoff` + writes a digest.
+- **Liveness (join, not stored in claim):** lane-owned heartbeat-file mtime, if ever built. `pid` is info-only. (Overseer/tmux liveness descoped 2026-07-08.)
+- **Pairing — PERMANENTLY DESCOPED 2026-07-08** (Commander directive: no tmux, no zeos; zeos retired). The claim record's optional `role` field stays in the schema (additive-evolution law) but nothing sets `advisor`; the 7-var env contract and bootstrap injection are dead. **Session succession is `lane handoff`** (owner-only): flips `claim_status:handoff` + writes a digest — implemented and unaffected.
 - **Audit:** append-only JSONL `{event: claim|renew|release|force|takeover|handoff|secret_requested, lane, linear_key, instance, role, ts}`.
 - **Stale/orphan:** `EXPIRED` (past TTL) / `possibly-stale` (active, idle >3h) / `orphaned` (active, no live session) — surfaced by `lane board`; **release always operator-gated**, never auto-stolen.
 - **Commit guard (Slice 3.5):** `lane check` answers "does an ACTIVE claim owned by THIS instance equal-or-ancestor-cover this path?" (read-only, offline, all-namespace scan by default — namespace inference from a worktree's toplevel basename is wrong by construction; identity required, never guessed). `lane hook install` writes a marked pre-commit block into the repo's RESOLVED hooks dir (one install covers all worktrees), composing with — never clobbering — foreign hooks; a managed `core.hooksPath` (husky et al.) is refused with the exact paste-in snippet. Modes via `git config lane.hook.mode`: `advise` (warn, default) / `enforce` (fail closed); `LANE_HOOK_BYPASS=1` is the loud human bypass. The hook never auto-claims and never mutates lane state. Residual: `git commit --no-verify` skips pre-commit — consumer doctrine forbids it for agents; a CI-side backstop is a later slice.
 
 ## 9. Offline / local-only mode (REQUIRED — first-class constraint)
 
-`claim | status | list | renew | release` (+ local pairing/handoff/audit) **work with NO Linear, NO GitHub, NO 1Password, NO homebox, NO Vantage.** They touch only local files under `LANE_ROOT`. Network services (Linear reads, GitHub-integration status movement, 1Password fetch for Linear writes) **enrich planning/closeout only** and fail closed without blocking local logistics. Verified by an explicit offline test (§16).
+`claim | status | list | check | renew | release` (+ local handoff/audit) **work with NO Linear, NO GitHub, NO 1Password, NO homebox, NO Vantage.** They touch only local files under `LANE_ROOT`. Network services (Linear reads, GitHub-integration status movement, 1Password fetch for Linear writes) **enrich planning/closeout only** and fail closed without blocking local logistics. Verified by an explicit offline test (§16).
 
 ## 10. Git discipline
 
@@ -140,7 +140,7 @@ Full per-surface enumeration with migration mechanics is in
 
 ## 15. Implementation slices (reference)
 
-0a (this doc + the inventory) → 0b doctrine edits (gated) → 1 read-only `lane board` → 2 locking core + offline mode → 3 lane lifecycle + pairing + zeos skill-wrap → **3.5 commit-guard adapter (`check` + `hook`, ZER-84)** → 4 Linear read adapter + 1Password + gated writes → 5 migration tooling + installer. Daemon/dashboard + hard cross-host locking are later embed-first COAs.
+0a (this doc + the inventory) → 0b doctrine edits (gated) → 1 read-only `lane board` → 2 locking core + offline mode → 3 lane lifecycle (as-built: worktree adapter + `start`/`close`/`handoff`; the pairing/zeos portions of the original Slice 3 name were permanently descoped 2026-07-08) → **3.5 commit-guard adapter (`check` + `hook`, ZER-84)** → 4 Linear read adapter + 1Password + gated writes (scope pinned, ZER-85) → 5 migration tooling + installer. Daemon/dashboard + hard cross-host locking are later embed-first COAs.
 
 ## 16. Test strategy
 
@@ -148,4 +148,4 @@ Unit (claim overlap, TTL math, JSON schema, redaction, `op` reference parsing �
 
 ## 17. Open decisions
 
-GitHub remote (deferred to installer slice); liveness source (overseer vs heartbeat files); Linear team→repo map; 1Password vault/item naming convention (references only). Name `lane`, path `~/projects-local/lane`, Rust, config root `~/.lane` are confirmed.
+GitHub remote (deferred to installer slice); Linear team→repo map; 1Password vault/item naming convention (references only). Name `lane`, path `~/projects-local/lane`, Rust, config root `~/.lane` are confirmed. RESOLVED 2026-07-08: liveness source = lane-owned heartbeat files (overseer/tmux descoped with the zeos retirement).

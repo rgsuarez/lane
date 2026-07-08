@@ -9,18 +9,23 @@ is in `docs/lane_SPEC.md` and the master plan
 `check` + `hook`, ZER-84; 227 tests at the 3.5 baseline). lane was **adopted machine-wide
 2026-07-07** (Linear ZER-82; consumer doctrine in eleetai CLAUDE.md § MULTI-AGENT
 WORKTREE POLICY). Trust `git log` + `session-journals/` (newest first) over any stale
-pointer. Next slice = **4 (Linear read adapter + 1Password + pairing residue from 3)**,
+pointer. Next slice = **4 (Linear read adapter + 1Password + gated writes — nothing else)**,
 then 0b/5. The north star (a local app that *replaces Vantage in daily orchestration*) is
 **not yet realized** — Vantage exit criteria remain open. Known flake quarantine: Linear
 ZER-83 (`tests/lock_concurrency.rs` release-profile timing) — do not entangle.
+**PERMANENT DESCOPE (2026-07-08 Commander directive): no tmux, no zeos, no pairing
+runtime, no overseer — zeos is retired.** Slice 4 = Linear read adapter + 1Password +
+gated writes ONLY. Never resurrect `lane pair`, skill-wraps, or tmux integration.
 
 ## North star
 
 `lane` is a **portable, Linear-first, offline-capable local agent-work orchestration
 app**. It owns machine-local logistics: lane claims, worktree coordination, session
-visibility, advisor/executor pairing, gates, local audit, and closeout. It is separate
-from zeos and callable by zeos via a skill-wrap. It is **Vantage-migration-aware, never
-Vantage-compatible** — the core runtime never calls Vantage.
+visibility, commit-time coverage enforcement, gates, local audit, and closeout. It is a
+**standalone CLI invoked directly by agent sessions** — no wrapper, no skill layer, no
+tmux (zeos retired 2026-07; pairing permanently descoped 2026-07-08). It is
+**Vantage-migration-aware, never Vantage-compatible** — the core runtime never calls
+Vantage.
 
 ## Source-of-truth boundaries
 
@@ -29,8 +34,7 @@ Vantage-compatible** — the core runtime never calls Vantage.
 | **Linear** | Planning (issues/projects/status/assignee/labels) |
 | **GitHub** | Code / CI / review / deploy |
 | **1Password** | Secrets (`op` CLI; never values on disk) |
-| **`lane`** | Machine-local logistics (claims, sessions, pairing, gates, local audit) |
-| **zeos** | Operator-OS wrapper / memory; calls `lane` via a skill |
+| **`lane`** | Machine-local logistics (claims, sessions, commit guard, gates, local audit) |
 | **Vantage** | Legacy archive / migration source / reference only |
 
 ## The locking core is permanently offline
@@ -43,7 +47,7 @@ worktree enrichment is OPT-IN (`--worktrees git`); the default spawns nothing an
 nothing outside `$LANE_ROOT`.
 
 This does **not** prohibit *adapter* modules (Git worktree, Linear GraphQL, 1Password,
-tmux/overseer liveness). Those live **outside the locking core** and never make the core
+heartbeat-file liveness). Those live **outside the locking core** and never make the core
 itself reach the network. Slice 3 added the first one: `src/git/` (local `git` shell-outs
 under a bounded wait) plus the `start`/`close` COMPOSITION verbs in `src/lifecycle.rs`,
 which orchestrate core primitives + the adapter and hold NO core mutex across a git spawn.
@@ -149,6 +153,7 @@ check passes.
 
 ## Prohibited scope (locking core)
 
-No daemon / DB / async / HTTP / network *in the locking core*; no real git-worktree or tmux
-*in the core*; no cross-host locking; no Slice 0b doctrine edits. (Adapters that add those
-capabilities are future gated slices, not permanently banned.)
+No daemon / DB / async / HTTP / network *in the locking core*; no real git-worktree work
+*in the core*; no cross-host locking; no Slice 0b doctrine edits. (Adapters that add such
+capabilities are future gated slices — EXCEPT tmux/zeos/pairing/overseer integration,
+which is PERMANENTLY banned per the 2026-07-08 Commander directive.)

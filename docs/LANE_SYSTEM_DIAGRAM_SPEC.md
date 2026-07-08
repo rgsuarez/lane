@@ -36,9 +36,9 @@ Use these styles consistently:
 11. It does not store secrets.
 12. 1Password is the planned default secret provider.
 13. It does not replace agent memory or journals.
-14. zeos remains the operator OS, memory, journal, and skill layer.
+14. zeos is RETIRED (2026-07): agent sessions invoke the `lane` CLI directly — no wrapper, no skill layer, no tmux (Commander directive 2026-07-08).
 15. It does not make optional liveness systems authoritative.
-16. Overseer may later enrich local claims with session and pair liveness.
+16. Future liveness enrichment, if built, uses lane-owned heartbeat files (Overseer/tmux permanently descoped 2026-07-08).
 17. It does not depend on Vantage during normal runtime.
 18. Vantage is migration-aware legacy input and historical archive only.
 19. Each machine initially owns only its own local lane state.
@@ -64,9 +64,9 @@ Use these styles consistently:
 16. The core has no live Linear client.
 17. The Git adapter (worktree/branch/hooks-dir/config plumbing) lives OUTSIDE the locking core; the core itself never spawns git.
 18. The core has no live 1Password integration.
-19. The core has no tmux session spawning.
-20. The core has no advisor/executor pairing runtime.
-21. The core has no live Overseer integration.
+19. tmux session spawning is PERMANENTLY DESCOPED (2026-07-08 Commander directive: no tmux, no zeos) — not pending.
+20. Advisor/executor pairing runtime and the `lane pair` verb are PERMANENTLY DESCOPED (2026-07-08) — session succession is the implemented `lane handoff`.
+21. Overseer integration is PERMANENTLY DESCOPED (tmux-based; same directive).
 22. The core has no Vantage migration executable.
 23. The core has no cross-host locking.
 
@@ -78,8 +78,8 @@ Use these styles consistently:
 | 3.2 | GitHub | Code, branches, commits, PRs, CI, reviews, releases, deployment lineage | Local work ownership |
 | 3.3 | 1Password | Secret storage and approved retrieval | Planning, code, local claims |
 | 3.4 | `lane` | Machine-local claim ownership, target reservations, leases, local audit | Portfolio planning or secrets |
-| 3.5 | zeos | Profiles, skills, private journals, memory, operator continuity | Claim authority |
-| 3.6 | Overseer | Optional local pair and process liveness | Claim authority |
+| 3.5 | zeos | RETIRED 2026-07 — operator memory/journals live with the agent tooling; lane is invoked directly, no wrapper | — |
+| 3.6 | Overseer | RETIRED for lane 2026-07-08 (tmux-based) — future liveness, if any, is lane-owned heartbeat files | — |
 | 3.7 | Vantage | Historical LOE archive and migration input | Future planning, claims, sessions, secrets |
 
 ## 4. Primary actors
@@ -103,23 +103,17 @@ Use these styles consistently:
 5. presents an explicit instance identity to `lane`.
 6. Claims, renews, and releases local work.
 
-### 4.3 Advisor agent
+### 4.3 Advisor agent — DESCOPED 2026-07-08
 
-1. Reviews or guides an executor.
-2. Will eventually attach to the same Linear issue.
-3. Will eventually carry `role=advisor`.
-4. Will eventually reference an active executor.
-5. Will participate in handoff and closeout.
-6. Advisor pairing is planned, not implemented.
+1. Advisor/executor pairing, tmux lanes, and the `lane pair` verb are permanently descoped (Commander directive: no tmux, no zeos).
+2. The claim record's optional `role` field stays in the schema (additive-evolution law) but nothing sets `advisor`.
+3. Session succession uses the implemented `lane handoff` (owner-only status flip + digest), which is unaffected.
 
-### 4.4 zeos
+### 4.4 zeos — RETIRED 2026-07
 
-1. Maintains operator identity and profiles.
-2. Maintains journals and memory.
-3. Provides skills and workflow doctrine.
-4. Will invoke `lane` through a skill wrapper.
-5. Will consume structured JSON responses.
-6. Does not own or modify claim authority independently.
+1. zeos is deprecated and being retired; lane never integrates with it.
+2. Agent sessions (Claude Code et al.) invoke the `lane` CLI directly — no wrapper, no skill layer.
+3. Operator memory/journals belong to the agent tooling, never to lane.
 
 ## 5. CLI boundary
 
@@ -141,8 +135,9 @@ Use these styles consistently:
 
 1. `lane pull`
 2. `lane plan`
-3. `lane pair`
-4. `lane migrate`
+3. `lane migrate`
+
+(`lane pair` was removed from the plan 2026-07-08 — pairing/tmux/zeos permanently descoped.)
 
 ### 5.3 CLI validation
 
@@ -360,7 +355,7 @@ Future slices populate:
 
 1. Linear key.
 2. Branch.
-3. Executor or advisor role.
+3. Executor or advisor role (schema-retained optional field; pairing descoped 2026-07-08 — nothing sets `advisor`).
 4. PR URL.
 5. Workflow gate.
 6. Plan path.
@@ -740,7 +735,7 @@ Future provider state:
 
 1. Worktrees come from `git worktree list`.
 2. Linear issues come from a read-only GraphQL adapter.
-3. Liveness comes from Overseer, heartbeat files, or tmux.
+3. Liveness, if built, comes from lane-owned heartbeat files (Overseer/tmux descoped 2026-07-08).
 
 Every board value carries provenance:
 
@@ -775,20 +770,17 @@ Use dashed blue arrows for this section.
 6. `lane start` creates a purpose-named branch.
 7. `lane start` creates an isolated Git worktree.
 8. `lane claim` reserves the issue and target locally.
-9. `lane start` launches an executor session.
-10. `lane pair` attaches an advisor.
-11. zeos stores private memory and journals.
-12. Overseer optionally reports session and pair liveness.
-13. The executor implements work inside the isolated worktree.
-14. The executor periodically runs `lane renew`.
-15. Commits are pushed to GitHub.
-16. A GitHub PR is created.
-17. GitHub CI and reviews determine readiness.
-18. GitHub integration links the PR to Linear.
-19. Linear status moves through GitHub integration where supported.
-20. `lane handoff` creates a transition digest when ownership changes.
-21. `lane close` drafts a sanitized Linear closeout.
-22. Commander approves the Linear mutation.
+9. The operator opens the executor session in the worktree (lane spawns no sessions; pairing/tmux/zeos descoped 2026-07-08).
+10. The executor implements work inside the isolated worktree; the pre-commit guard (`lane hook`) checks claim coverage on every commit.
+11. The executor periodically runs `lane renew`.
+12. Commits are pushed to GitHub.
+13. A GitHub PR is created.
+14. GitHub CI and reviews determine readiness.
+15. GitHub integration links the PR to Linear.
+16. Linear status moves through GitHub integration where supported.
+17. `lane handoff` creates a transition digest when ownership changes.
+18. `lane close` drafts a sanitized Linear closeout.
+19. Commander approves the Linear mutation.
 23. `lane release` removes the local claim.
 24. Local audit remains in `audit.log`.
 25. GitHub retains the code and review history.
@@ -866,11 +858,11 @@ Rules:
 
 1. Commander
 2. Executor agent
-3. Advisor agent
+3. Advisor agent (RETIRED 2026-07-08 — do not draw; pairing descoped)
 
 ### 24.2 Local application nodes
 
-4. zeos
+4. zeos (RETIRED 2026-07 — do not draw; agents invoke the CLI directly)
 5. `lane` CLI
 6. Input validator
 7. JSON/human renderer
@@ -908,7 +900,7 @@ Rules:
 33. Linear
 34. GitHub
 35. 1Password
-36. Overseer
+36. Overseer (RETIRED for lane 2026-07-08 — do not draw)
 37. Git worktrees
 38. Vantage archive
 39. Other-host `lane`
@@ -972,21 +964,18 @@ Use solid green arrows.
 
 ## 26. Planned edges
 
-Use dashed blue arrows.
+Use dashed blue arrows. (Former zeos/advisor-pair/Overseer edges were removed 2026-07-08 — permanently descoped, not planned.)
 
-1. zeos → `lane` CLI.
-2. Advisor agent → `lane pair`.
-3. Board assembler → Overseer.
-4. Board assembler → Linear.
-5. Git worktrees → GitHub branch and PR.
-6. GitHub → Linear status integration.
-7. `lane` Linear adapter → 1Password.
-8. 1Password → temporary child environment.
-9. `lane close` → operator-gated Linear write.
-10. Vantage archive → migration tool.
-11. Migration tool → Linear.
-12. Multiple local `lane` installations → read-only aggregate board.
-13. Multiple hosts → future shared lock service, only if approved.
+1. Board assembler → Linear.
+2. Git worktrees → GitHub branch and PR.
+3. GitHub → Linear status integration.
+4. `lane` Linear adapter → 1Password.
+5. 1Password → temporary child environment.
+6. `lane close` → operator-gated Linear write.
+7. Vantage archive → migration tool.
+8. Migration tool → Linear.
+9. Multiple local `lane` installations → read-only aggregate board.
+10. Multiple hosts → future shared lock service, only if approved.
 
 ## 27. Forbidden edges
 
@@ -1005,8 +994,9 @@ Use red crossed-out arrows.
 11. `lane` ✕ custom message bus.
 12. `lane` ✕ custom distributed lock protocol.
 13. Overseer ✕ claim authority.
-14. zeos journals ✕ public Linear comments.
+14. Operator journals/memory ✕ public Linear comments.
 15. Raw transcripts ✕ Linear.
+16. `lane` ✕ tmux/zeos integration (permanently descoped 2026-07-08 — Commander directive).
 
 ## 28. Recommended master diagram
 
@@ -1017,19 +1007,19 @@ Create a 16:9 landscape diagram with three panels.
 Top row:
 
 ```text
-Commander → Executor Agent ↔ Advisor Agent
+Commander → Executor Agent(s)
 ```
 
 Middle:
 
 ```text
-zeos → lane CLI
+Agent session → lane CLI (direct; no wrapper)
 ```
 
 Right-side external sources of truth:
 
 ```text
-Linear | GitHub | 1Password | Overseer
+Linear | GitHub | 1Password
 ```
 
 Bottom-right legacy:
@@ -1045,8 +1035,8 @@ Planning = Linear
 Code/CI/Review = GitHub
 Secrets = 1Password
 Local ownership = lane
-Memory/Journals = zeos
-Liveness = Overseer
+Memory/Journals = agent tooling (zeos retired)
+Liveness = heartbeat files (future)
 Archive = Vantage
 ```
 
@@ -1086,16 +1076,16 @@ Linear Issue
  → Plan
  → Branch + Worktree
  → Local Claim
- → Executor + Advisor Work
+ → Executor Work (commit-guarded)
  → Renew
  → GitHub PR + CI
  → Handoff or Close
  → Release
 ```
 
-Use solid arrows only for currently implemented claim/status/renew/release/audit
-operations. Use dashed arrows for Linear, live Git, pairing, tmux, 1Password, and
-closeout.
+Use solid arrows for implemented operations: claim/status/list/renew/handoff/release,
+audit, worktree lifecycle (`start`/`close`), and the commit guard (`check` + `hook`).
+Use dashed arrows for Linear, 1Password, and gated closeout.
 
 ## 29. Recommended secondary diagrams
 
@@ -1106,7 +1096,7 @@ Create four supporting diagrams in addition to the master architecture:
 2. **Crash-recovery state diagram**
    - Intent, mutation, completion, dangling classifications.
 3. **Source-of-truth diagram**
-   - Linear, GitHub, 1Password, lane, zeos, Overseer, Vantage.
+   - Linear, GitHub, 1Password, lane, Vantage (zeos/Overseer retired).
 4. **Migration timeline**
    - Vantage archive → Linear/1Password/lane → Vantage exit.
 

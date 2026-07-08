@@ -27,8 +27,9 @@ git -C <repo> config lane.hook.mode enforce   # no reinstall needed
    lane hook install --git-repo /Users/richie/projects-local/lane --repo lane
    ```
    First repo to flip enforce after soak.
-2. **Greenfield fleet** — crypto-bot, vantage, verify, zeos (verified: no hooks, no
-   `core.hooksPath`; native mode, instant):
+2. **Greenfield fleet** — crypto-bot, vantage, verify (verified: no hooks, no
+   `core.hooksPath`; native mode, instant). The zeos repo is excluded — zeos is retired
+   (2026-07); do not install new tooling into it:
    ```bash
    lane hook install --git-repo <repo> --repo <namespace>
    ```
