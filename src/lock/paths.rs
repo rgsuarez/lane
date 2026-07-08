@@ -65,6 +65,14 @@ impl LaneRoot {
     pub fn audit_path(&self, repo: &str) -> PathBuf {
         self.repo_dir(repo).join("audit.log")
     }
+    /// The ROOT-level adapter audit file (`secret_requested` / `linear_write` events).
+    /// Distinct from every per-repo `audit_path` on purpose: core recovery and
+    /// intent-reconciliation only ever open per-repo audit files (repo names are
+    /// `validate_name`d segments, so `<root>/audit.log` is unreachable from them),
+    /// which keeps adapter events structurally unable to fail-close core mutations.
+    pub fn root_audit_path(&self) -> PathBuf {
+        self.path.join("audit.log")
+    }
     pub fn temp_path(&self, repo: &str, lane: &str, token: &str) -> PathBuf {
         self.locks_dir(repo)
             .join(format!("{lane}.lock.{token}.tmp"))

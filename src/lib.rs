@@ -17,6 +17,7 @@ pub mod lock;
 pub mod model;
 pub mod output;
 mod proc;
+pub mod secrets;
 
 pub use board::{assemble, classify_stale, BoardInputs};
 pub use error::{LaneError, Reason, RefusedReason};

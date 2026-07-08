@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 /// Captured result of one bounded invocation (raw bytes).
 #[derive(Debug, Clone)]
-pub(crate) struct ProcOutput {
+pub struct ProcOutput {
     /// Exit code, or `None` when the process was terminated by a signal (including our kill).
     pub code: Option<i32>,
     pub stdout: Vec<u8>,
@@ -24,7 +24,7 @@ pub(crate) struct ProcOutput {
 
 /// The two spawn-layer failure classes. Adapters map these into their own error types.
 #[derive(Debug)]
-pub(crate) enum ProcError {
+pub enum ProcError {
     /// The process could not be spawned, or an I/O error occurred while waiting.
     Spawn(io::Error),
     /// The process did not finish within the bounded wait and was killed.
@@ -34,7 +34,7 @@ pub(crate) enum ProcError {
 /// Spawn a command, drain its pipes on threads, and wait no longer than `timeout` before
 /// killing it. The drainer threads prevent a full pipe buffer from deadlocking the poll
 /// loop, so even a chatty command is captured or cleanly killed.
-pub(crate) fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<ProcOutput, ProcError> {
+pub fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<ProcOutput, ProcError> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
