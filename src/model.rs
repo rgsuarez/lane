@@ -14,6 +14,9 @@ pub enum Provenance {
     Derived,
     /// Read from a fixture file (Slice 1 stand-in for a real provider).
     Fixture,
+    /// Fetched from the live network source (possibly via the TTL read cache) —
+    /// honest network provenance, distinct from locally-`Derived` values (Slice 4).
+    Live,
     /// Not determinable in this slice (e.g. liveness without overseer/tmux).
     Unknown,
 }

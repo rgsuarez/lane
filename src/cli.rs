@@ -21,6 +21,18 @@ pub enum WorktreeSource {
     Git,
 }
 
+/// Board Linear-source selection (Slice 4). Same law as `WorktreeSource`: the live
+/// source is OPT-IN; the default board resolves no secret and touches no network.
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LinearSource {
+    /// No Linear enrichment (the offline default).
+    #[default]
+    Off,
+    /// Live Linear GraphQL per claimed `linear_key` (op-resolved key at call time;
+    /// fail-soft — a degraded source never stops the board; TTL-cached).
+    Api,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "lane",
@@ -376,6 +388,10 @@ pub struct BoardArgs {
     /// each targeted claim's path; fail-soft). A fixture flag overrides this.
     #[arg(long, value_enum, default_value_t = WorktreeSource::Off)]
     pub worktrees: WorktreeSource,
+    /// Linear source: `off` (default; offline) or `api` (live GraphQL per claimed
+    /// linear_key; op-resolved key; fail-soft; TTL-cached). `--linear-fixture` overrides.
+    #[arg(long, value_enum, default_value_t = LinearSource::Off)]
+    pub linear: LinearSource,
 }
 
 /// Resolve the lane root from the process environment: explicit flag, then

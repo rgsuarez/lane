@@ -139,9 +139,10 @@ pub fn run_board(args: &BoardArgs) -> anyhow::Result<()> {
         }
         (None, cli::WorktreeSource::Off) => Box::new(worktrees::EmptyWorktreeProvider),
     };
-    let linear: Box<dyn LinearProvider> = match &args.linear_fixture {
-        Some(path) => Box::new(linear::FixtureLinearProvider::from_file(path)?),
-        None => Box::new(linear::NoLinearProvider),
+    let linear: Box<dyn LinearProvider> = match (&args.linear_fixture, args.linear) {
+        (Some(path), _) => Box::new(linear::FixtureLinearProvider::from_file(path)?),
+        (None, cli::LinearSource::Api) => Box::new(linear::ApiLinearProvider::new(&root)),
+        (None, cli::LinearSource::Off) => Box::new(linear::NoLinearProvider),
     };
     let liveness = liveness::StubLivenessProvider;
 

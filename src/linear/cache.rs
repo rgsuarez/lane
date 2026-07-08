@@ -51,16 +51,22 @@ pub fn read_fresh<T: DeserializeOwned>(
     Some(envelope)
 }
 
-/// Best-effort write (dir create + temp-in-same-dir + rename, pid-suffixed temp so
-/// concurrent writers never collide; last-write-wins is fine for a cache). Returns
-/// a warning string on failure — callers surface it on stderr, never fail on it.
+/// Best-effort write of a [`CacheEnvelope`]-wrapped payload. See [`write_raw`].
 pub fn write<T: Serialize>(path: &Path, payload: &T, now: DateTime<Utc>) -> Option<String> {
     let envelope = CacheEnvelope {
         fetched_at: now,
         payload,
     };
+    write_raw(path, &envelope)
+}
+
+/// Best-effort raw write (dir create + temp-in-same-dir + rename, pid-suffixed temp
+/// so concurrent writers never collide; last-write-wins is fine for a cache) for
+/// payloads that carry their own freshness (e.g. the per-entry by-key map). Returns
+/// a warning string on failure — callers surface it on stderr/notes, never fail.
+pub fn write_raw<T: Serialize>(path: &Path, payload: &T) -> Option<String> {
     let attempt = (|| -> std::io::Result<()> {
-        let json = serde_json::to_string(&envelope)
+        let json = serde_json::to_string(payload)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
