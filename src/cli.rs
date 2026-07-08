@@ -359,6 +359,15 @@ pub struct CloseArgs {
     /// Also remove the claim's git worktree (never forced; dirty refuses).
     #[arg(long)]
     pub remove_worktree: bool,
+    /// PURE PREVIEW: compose and print the redacted Linear closeout draft. Closes
+    /// nothing, posts nothing, resolves no secret, touches no network.
+    #[arg(long, conflicts_with_all = ["post_closeout", "remove_worktree"])]
+    pub draft_closeout: bool,
+    /// The explicit operator go for the gated Linear write: post the closeout
+    /// comment to the claim's linear_key issue (serialized, generation-guarded,
+    /// marker-deduped), then close. Composes with --remove-worktree.
+    #[arg(long)]
+    pub post_closeout: bool,
     #[arg(long)]
     pub json: bool,
     #[arg(long)]

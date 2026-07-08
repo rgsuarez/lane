@@ -27,16 +27,21 @@ use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 
 use crate::cli::{CloseArgs, StartArgs};
+use crate::config::{LaneConfig, ROLE_LINEAR_API};
 use crate::error::{LaneError, RefusedReason};
 use crate::git::{GitAdapter, GitError, GitRunner, StdGitRunner};
-use crate::lock::audit::StdAuditSink;
+use crate::linear::transport::{LinearTransport, UreqTransport};
+use crate::linear::{api, draft, publish};
+use crate::lock::audit::{AuditEvent, AuditEventKind, AuditOutcome, AuditSink, StdAuditSink};
 use crate::lock::claim::claim_core;
+use crate::lock::paths::LaneRoot;
 use crate::lock::renew_release::{release_core, renew_core};
 use crate::lock::{
-    emit, record, require_instance, resolve_root, validate_name, ClaimParams, CommandError,
+    emit, record, require_instance, resolve_root, validate_name, ClaimParams, CommandError, FsOps,
     Outcome, ReleaseParams, RenewParams, VerbData,
 };
-use crate::model::{ClaimStatus, Role};
+use crate::model::{ClaimRecord, ClaimStatus, Role};
+use crate::secrets::{OpRunner, SecretResolver, SecretValue, StdOpRunner};
 
 /// Map a git-adapter error to the authoritative error type. A dirty-worktree refusal is
 /// a safe exit-1 refusal (`dirty_worktree`); every other git failure (plumbing, timeout,
@@ -266,6 +271,9 @@ fn compensate_start_failure(
         repo: repo.to_string(),
         lane: lane.to_string(),
         instance: instance.to_string(),
+        // Compensation releases the claim `start` just created; no generation bind
+        // (nothing else can have re-claimed under the still-held flow).
+        expected_claimed_at: None,
     };
     match release_core(root, &rel, now, fs, sink) {
         Ok(s) => warnings.push(s.audit_warning),
@@ -276,36 +284,135 @@ fn compensate_start_failure(
     join_warnings(warnings)
 }
 
-/// `lane close` runner (production: real git runner, real clock).
-pub fn run_close(args: &CloseArgs) -> i32 {
-    run_close_at(args, Utc::now(), &StdGitRunner::new())
+/// Injectable dependencies for the `close` composition (production: real git, real
+/// `op`, real HTTP; tests substitute any subset). The op/transport seams are only
+/// exercised in the gated-closeout modes — a plain close never touches them.
+pub(crate) struct CloseDeps<'a> {
+    pub git: &'a dyn GitRunner,
+    pub op: &'a dyn OpRunner,
+    pub transport: &'a dyn LinearTransport,
 }
 
-pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, runner: &dyn GitRunner) -> i32 {
+/// `lane close` runner (production: real git/op/HTTP, real clock).
+pub fn run_close(args: &CloseArgs) -> i32 {
+    let git = StdGitRunner::new();
+    let op = StdOpRunner::new();
+    let transport = UreqTransport::new();
+    run_close_at(
+        args,
+        Utc::now(),
+        &CloseDeps {
+            git: &git,
+            op: &op,
+            transport: &transport,
+        },
+    )
+}
+
+/// Which closeout mode the flags selected (clap enforces exclusivity).
+enum CloseoutMode {
+    Normal,
+    Draft,
+    Post,
+}
+
+/// The Slice-4 generation re-check: the live record must be the SAME claim
+/// generation the close bound to at step 0 — same `instance`, same `linear_key`,
+/// exact `claimed_at` — and unexpired. Run before the gated publish path proceeds
+/// (a takeover, expiry, or same-instance release+reclaim aborts with nothing done).
+fn verify_generation(
+    lock_path: &Path,
+    root: &LaneRoot,
+    fs: &dyn FsOps,
+    bound: &ClaimRecord,
+    instance: &str,
+    now: DateTime<Utc>,
+) -> Result<(), LaneError> {
+    match record::read_claim(lock_path, root.path(), root.expected_uid(), fs)? {
+        None => Err(LaneError::Refused(RefusedReason::NotHeld)),
+        Some(cur) => {
+            if cur.instance != instance {
+                return Err(LaneError::Refused(RefusedReason::NotOwner));
+            }
+            if cur.claimed_at != bound.claimed_at {
+                // A successor generation of the same lane (same-instance
+                // release+reclaim): the claim this close bound to no longer exists.
+                return Err(LaneError::Refused(RefusedReason::NotHeld));
+            }
+            if cur.linear_key != bound.linear_key {
+                return Err(LaneError::Identity(
+                    "claim's linear_key changed mid-close; re-run".to_string(),
+                ));
+            }
+            if cur.expires_at <= now {
+                return Err(LaneError::Refused(RefusedReason::Expired));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Post-mode context threaded from preflight to the publish step. Holds the
+/// publish-lock guard so the ENTIRE mutation-and-publish section stays serialized
+/// (the guard drops after release, at the end of the closure).
+struct CloseoutCtx {
+    draft_body: String,
+    key: String,
+    issue_uuid: String,
+    already_posted: bool,
+    secret: SecretValue,
+    api_url: String,
+    _publish_guard: publish::PublishGuard,
+}
+
+pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, deps: &CloseDeps) -> i32 {
     let repo = Some(args.repo.clone());
     let lane = Some(args.lane.clone());
     let fs = crate::lock::StdFs;
     let home = std::env::var("HOME").ok();
+    let runner = deps.git;
     let result = (|| -> Result<(Outcome, Option<VerbData>, Option<String>), CommandError> {
         let instance = require_instance(args.instance.clone())?;
         validate_name("repo", &args.repo)?;
         validate_name("lane", &args.lane)?;
         let root = resolve_root(args.lane_root.clone(), home.as_deref(), &fs)?;
         let sink = StdAuditSink::new(root.audit_path(&args.repo), root.expected_uid());
+        let mode = if args.draft_closeout {
+            CloseoutMode::Draft
+        } else if args.post_closeout {
+            CloseoutMode::Post
+        } else {
+            CloseoutMode::Normal
+        };
+        let close_data = |released: bool,
+                          worktree_removed: bool,
+                          skipped: bool,
+                          draft: Option<String>,
+                          posted: Option<bool>,
+                          already: Option<bool>,
+                          url: Option<String>| {
+            VerbData::Close {
+                lane: args.lane.clone(),
+                released,
+                worktree_removed,
+                skipped_missing_worktree: skipped,
+                closeout_draft: draft,
+                closeout_posted: posted,
+                closeout_already_posted: already,
+                closeout_comment_url: url,
+            }
+        };
 
         // Step 0 — absence check FIRST (guarded read, no mutex): close-of-absent mirrors
         // release exactly (`not_held`, exit 0), BEFORE any renew attempt (renew's own
         // not_held is a refusal, the wrong contract here). Later steps re-verify under
         // the core mutexes, so this unguarded read cannot be the final authority.
+        // Draft/Post modes get the same contract: an unheld lane has nothing true to
+        // draft, so nothing is composed and nothing is posted.
         let lock_path = root.lock_path(&args.repo, &args.lane);
         let rec = match record::read_claim(&lock_path, root.path(), root.expected_uid(), &fs)? {
             None => {
-                let data = VerbData::Close {
-                    lane: args.lane.clone(),
-                    released: false,
-                    worktree_removed: false,
-                    skipped_missing_worktree: false,
-                };
+                let data = close_data(false, false, false, None, None, None, None);
                 return Ok((Outcome::NotHeld, Some(data), None));
             }
             Some(r) => r,
@@ -315,7 +422,109 @@ pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, runner: &dyn Gi
         let mut skipped_missing = false;
         let mut warnings: Vec<Option<String>> = Vec::new();
 
-        if args.remove_worktree {
+        // Step 0.5 — LOCAL compose (Draft|Post): linear_key gate, whitelist composer,
+        // reference scrub. Pure-local: no secret, no network, no mutation.
+        let mut closeout: Option<CloseoutCtx> = None;
+        if !matches!(mode, CloseoutMode::Normal) {
+            let key = match rec.linear_key.clone() {
+                Some(k) => k,
+                None => {
+                    return Err(CommandError::from(LaneError::RefusedMsg {
+                        reason: RefusedReason::NoLinearKey,
+                        msg: format!(
+                            "claim {}/{} records no linear_key; run plain `lane close`, or re-claim/`lane start` with --linear-key",
+                            args.repo, args.lane
+                        ),
+                    }));
+                }
+            };
+            let draft_body = draft::compose_closeout(&rec, now);
+            if let Some(violation) = draft::scrub_violation(&draft_body, None) {
+                return Err(CommandError::from(LaneError::Io(std::io::Error::other(
+                    violation,
+                ))));
+            }
+            if matches!(mode, CloseoutMode::Draft) {
+                // PURE PREVIEW: zero mutation, zero spawns, zero network.
+                let data = close_data(false, false, false, Some(draft_body), None, None, None);
+                return Ok((Outcome::Ok, Some(data), None));
+            }
+
+            // ---- Post mode ----
+            // Step 0.6 — guarded publish lock BEFORE any secret resolution or local
+            // mutation: a busy loser (`mutex_busy`) and a poisoned lock object (exit 2)
+            // both provably touch nothing.
+            let publish_guard = publish::acquire(&root, &args.repo, &args.lane, &fs)?;
+            // Step 0.7 — generation re-check #1 (pre-lock races caught here).
+            verify_generation(&lock_path, &root, &fs, &rec, &instance, now)?;
+            // Step 0.8 — resolve the API key (audited to the ROOT adapter audit).
+            let config = LaneConfig::load(root.path(), root.expected_uid(), &fs)?;
+            let root_sink = StdAuditSink::new(root.root_audit_path(), root.expected_uid());
+            let resolver = SecretResolver {
+                config: &config,
+                runner: deps.op,
+                sink: &root_sink,
+                repo: &args.repo,
+                lane: &args.lane,
+                instance: &instance,
+            };
+            let (secret_result, audit_warn) = resolver.resolve(ROLE_LINEAR_API, now);
+            warnings.push(audit_warn);
+            let secret = match secret_result {
+                Ok(s) => s,
+                Err(error) => {
+                    return Err(CommandError {
+                        error,
+                        audit_warning: join_warnings(warnings),
+                    });
+                }
+            };
+            if let Some(violation) = draft::scrub_violation(&draft_body, Some(&secret)) {
+                return Err(CommandError {
+                    error: LaneError::Io(std::io::Error::other(violation)),
+                    audit_warning: join_warnings(warnings),
+                });
+            }
+            // Step 0.9 — ONE preflight read: issue UUID + marker scan. Inside the
+            // publish lock this scan IS the dedupe authority. Bad key / offline are
+            // caught here, before ANY mutation.
+            let marker = draft::closeout_marker(&args.lane, rec.claimed_at);
+            let preflight = match api::preflight_issue(
+                deps.transport,
+                &config.linear.api_url,
+                &secret,
+                &key,
+                &marker,
+            ) {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    return Err(CommandError {
+                        error: LaneError::Network(format!(
+                            "linear issue `{key}` not found (check the claim's linear_key)"
+                        )),
+                        audit_warning: join_warnings(warnings),
+                    });
+                }
+                Err(error) => {
+                    return Err(CommandError {
+                        error,
+                        audit_warning: join_warnings(warnings),
+                    });
+                }
+            };
+            closeout = Some(CloseoutCtx {
+                draft_body,
+                key,
+                issue_uuid: preflight.uuid,
+                already_posted: preflight.already_posted,
+                secret,
+                api_url: config.linear.api_url.clone(),
+                _publish_guard: publish_guard,
+            });
+        }
+        let post_mode = closeout.is_some();
+
+        if args.remove_worktree || post_mode {
             // Step 1 — RENEW FIRST: enforces owner + expiry (a lapsed lease is not yours
             // to tear down) AND extends the lease by the claim's own TTL, so the claim
             // cannot lapse into expiry-takeover while git runs. A NotHeld here means the
@@ -330,25 +539,24 @@ pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, runner: &dyn Gi
             let renewed = match renew_core(&root, &renew, now, &fs, &sink) {
                 Ok(s) => s,
                 Err(LaneError::Refused(RefusedReason::NotHeld)) => {
-                    let data = VerbData::Close {
-                        lane: args.lane.clone(),
-                        released: false,
-                        worktree_removed: false,
-                        skipped_missing_worktree: false,
-                    };
+                    // In post mode this is a post-generation-check race: nothing is
+                    // held, so nothing is closed and nothing is posted.
+                    let data = close_data(false, false, false, None, None, None, None);
                     return Ok((Outcome::NotHeld, Some(data), join_warnings(warnings)));
                 }
                 Err(e) => return Err(e.into()),
             };
             warnings.push(renewed.audit_warning);
-            // From here on, every failure path must CARRY the accumulated warnings (the
-            // renew may have succeeded with audit degradation; hiding that in a later
-            // git-error envelope would misreport the completed lease extension).
-            let fail = |e: crate::git::GitError, warnings: Vec<Option<String>>| CommandError {
-                error: git_to_lane(e),
-                audit_warning: join_warnings(warnings),
-            };
+        }
+        // From here on, every failure path must CARRY the accumulated warnings (the
+        // renew may have succeeded with audit degradation; hiding that in a later
+        // git-error envelope would misreport the completed lease extension).
+        let fail = |e: crate::git::GitError, warnings: Vec<Option<String>>| CommandError {
+            error: git_to_lane(e),
+            audit_warning: join_warnings(warnings),
+        };
 
+        if args.remove_worktree {
             // Step 2 — probe, then remove (no core mutex held across these spawns).
             let stored = rec.target_normalized.clone().or_else(|| rec.target.clone());
             if let Some(t) = stored {
@@ -444,18 +652,29 @@ pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, runner: &dyn Gi
                                 });
                             }
                         }
-                        // Defense-in-depth ownership RE-VERIFY immediately before the
-                        // destructive spawn: the renew extended the lease, so only a
-                        // deliberate `claim --force` can have changed ownership — but a
-                        // forced takeover mid-close must not have its fresh worktree
-                        // destroyed by the prior owner. A guarded read costs one stat.
+                        // Defense-in-depth ownership + GENERATION re-verify immediately
+                        // before the destructive spawn: the renew extended the lease, so
+                        // only a deliberate `claim --force` (different owner) or a
+                        // same-instance release+reclaim (successor GENERATION, Slice 4)
+                        // can have changed the record — and neither's fresh worktree may
+                        // be destroyed by this stale close. A guarded read costs one stat.
                         match record::read_claim(&lock_path, root.path(), root.expected_uid(), &fs)
                         {
-                            Ok(Some(cur)) if cur.instance == instance => {}
+                            Ok(Some(cur))
+                                if cur.instance == instance && cur.claimed_at == rec.claimed_at => {
+                            }
                             // A clean different owner is an ordinary refusal.
-                            Ok(Some(_)) => {
+                            Ok(Some(cur)) if cur.instance != instance => {
                                 return Err(CommandError {
                                     error: LaneError::Refused(RefusedReason::NotOwner),
+                                    audit_warning: join_warnings(warnings),
+                                });
+                            }
+                            // Same instance, successor generation: the claim this close
+                            // bound to is gone — never remove the successor's worktree.
+                            Ok(Some(_)) => {
+                                return Err(CommandError {
+                                    error: LaneError::Refused(RefusedReason::NotHeld),
                                     audit_warning: join_warnings(warnings),
                                 });
                             }
@@ -490,12 +709,90 @@ pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, runner: &dyn Gi
             }
         }
 
-        // Step 3 — release LAST (`release_core`'s internal mutex re-verifies ownership;
-        // it is the final authority).
+        // Step 2.5 — the gated write (Post): post-or-dedupe INSIDE the publish lock.
+        // The in-lock preflight marker scan is the dedupe authority: present ⇒ Linear
+        // already carries this generation's closeout (an earlier run's timeout landed,
+        // or a concurrent winner posted) ⇒ skip the create. A POST failure keeps the
+        // claim held (and renewed) — the rerun re-scans and posts only if absent.
+        let mut closeout_draft_out: Option<String> = None;
+        let mut closeout_posted: Option<bool> = None;
+        let mut closeout_already: Option<bool> = None;
+        let mut closeout_url: Option<String> = None;
+        if let Some(ctx) = &closeout {
+            closeout_draft_out = Some(ctx.draft_body.clone());
+            let root_sink = StdAuditSink::new(root.root_audit_path(), root.expected_uid());
+            if ctx.already_posted {
+                closeout_already = Some(true);
+            } else {
+                // Final generation re-check immediately before the remote write: core
+                // verbs don't take the publish lock, so a same-instance release+reclaim
+                // could still have raced the renew/removal window. One guarded read
+                // closes the whole local window; the residual (a reclaim between this
+                // read and Linear committing the create) is irreducible without
+                // cross-host locking — the marker makes such a comment self-identifying
+                // and the generation-guarded release keeps local state truthful.
+                if let Err(error) = verify_generation(&lock_path, &root, &fs, &rec, &instance, now)
+                {
+                    return Err(CommandError {
+                        error,
+                        audit_warning: join_warnings(warnings),
+                    });
+                }
+                match api::post_comment(
+                    deps.transport,
+                    &ctx.api_url,
+                    &ctx.secret,
+                    &ctx.issue_uuid,
+                    &ctx.draft_body,
+                ) {
+                    Ok(comment) => {
+                        closeout_posted = Some(true);
+                        closeout_url = comment.url;
+                        let mut event = AuditEvent::new(
+                            AuditEventKind::LinearWrite,
+                            &args.repo,
+                            &args.lane,
+                            &instance,
+                            AuditOutcome::Ok,
+                            now,
+                        );
+                        event.linear_key = Some(ctx.key.clone());
+                        if let Err(e) = root_sink.append(&event, true) {
+                            warnings
+                                .push(Some(format!("adapter audit degraded (linear_write): {e}")));
+                        }
+                    }
+                    Err(error) => {
+                        let mut event = AuditEvent::new(
+                            AuditEventKind::LinearWrite,
+                            &args.repo,
+                            &args.lane,
+                            &instance,
+                            AuditOutcome::Error,
+                            now,
+                        );
+                        event.linear_key = Some(ctx.key.clone());
+                        if let Err(e) = root_sink.append(&event, true) {
+                            warnings
+                                .push(Some(format!("adapter audit degraded (linear_write): {e}")));
+                        }
+                        return Err(CommandError {
+                            error,
+                            audit_warning: join_warnings(warnings),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Step 3 — release LAST, GENERATION-GUARDED (`release_core`'s internal mutex
+        // re-verifies ownership AND the claim generation; it is the final authority —
+        // a successor claim of the same lane survives a stale close, in every mode).
         let rel = ReleaseParams {
             repo: args.repo.clone(),
             lane: args.lane.clone(),
             instance,
+            expected_claimed_at: Some(rec.claimed_at),
         };
         let released = release_core(&root, &rel, now, &fs, &sink)?;
         warnings.push(released.audit_warning);
@@ -505,13 +802,17 @@ pub(crate) fn run_close_at(args: &CloseArgs, now: DateTime<Utc>, runner: &dyn Gi
         } else {
             Outcome::NotHeld
         };
-        let data = VerbData::Close {
-            lane: args.lane.clone(),
-            released: released.present,
+        let data = close_data(
+            released.present,
             worktree_removed,
-            skipped_missing_worktree: skipped_missing,
-        };
+            skipped_missing,
+            closeout_draft_out,
+            closeout_posted,
+            closeout_already,
+            closeout_url,
+        );
         Ok((outcome, Some(data), join_warnings(warnings)))
+        // `closeout` (holding the publish-lock guard) drops HERE — after release.
     })();
     emit(args.json, "close", repo, lane, result)
 }
@@ -838,6 +1139,297 @@ mod tests {
         assert!(
             !root.lock_path("ops", "demo").exists(),
             "the release still ran (cleanup faults never block it)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Slice 4 — gated-closeout generation/serialization races (in-process:
+    // these interpose between composition steps, which the spawned binary can't).
+    // ------------------------------------------------------------------
+
+    use crate::linear::transport::TransportError;
+    use crate::proc::{ProcError, ProcOutput};
+    use serde_json::json;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A no-op fake `op` (the tests use `op://` roles; the secret value is canned).
+    struct FakeOp;
+    impl OpRunner for FakeOp {
+        fn run(&self, _args: &[&str]) -> Result<ProcOutput, ProcError> {
+            Ok(ProcOutput {
+                code: Some(0),
+                stdout: b"fake-close-key".to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    /// A scriptable, thread-safe fake Linear transport. Preflights always report the
+    /// marker ABSENT — the races below resolve through the GENERATION checks and the
+    /// publish lock, never through marker dedupe (which the integration suite covers
+    /// with real marker round-trips against the loopback fixture).
+    struct FakeLinear {
+        creates: AtomicU32,
+        preflights: AtomicU32,
+        /// Called on the FIRST preflight (interposition hook: swap generations, etc.).
+        on_first_preflight: Option<Box<dyn Fn() + Sync + Send>>,
+        /// Called just before a create is recorded (interposition hook).
+        on_create: Option<Box<dyn Fn() + Sync + Send>>,
+    }
+    impl FakeLinear {
+        fn new() -> Self {
+            Self {
+                creates: AtomicU32::new(0),
+                preflights: AtomicU32::new(0),
+                on_first_preflight: None,
+                on_create: None,
+            }
+        }
+    }
+    impl LinearTransport for FakeLinear {
+        fn post_json(
+            &self,
+            _url: &str,
+            _auth: &SecretValue,
+            body: &serde_json::Value,
+        ) -> Result<serde_json::Value, TransportError> {
+            let query = body["query"].as_str().unwrap_or_default();
+            if query.contains("commentCreate") {
+                if let Some(hook) = &self.on_create {
+                    hook();
+                }
+                self.creates.fetch_add(1, Ordering::SeqCst);
+                return Ok(json!({ "data": { "commentCreate": {
+                    "success": true, "comment": { "url": "https://linear.app/c/1" } } } }));
+            }
+            let n = self.preflights.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                if let Some(hook) = &self.on_first_preflight {
+                    hook();
+                }
+            }
+            Ok(json!({ "data": { "issue": { "id": "uuid-1",
+                "comments": { "nodes": [] } } } }))
+        }
+    }
+
+    fn close_args(lane: &str, instance: &str, root: &Path) -> CloseArgs {
+        CloseArgs {
+            lane: lane.to_string(),
+            repo: "ops".to_string(),
+            remove_worktree: false,
+            draft_closeout: false,
+            post_closeout: true,
+            json: true,
+            lane_root: Some(root.to_path_buf()),
+            instance: Some(instance.to_string()),
+        }
+    }
+
+    fn write_close_config(root: &Path) {
+        std::fs::write(
+            root.join("config.toml"),
+            "[secrets.roles]\nlinear_api = \"op://V/I/f\"\n[linear]\napi_url = \"https://ignored.invalid/graphql\"\n",
+        )
+        .unwrap();
+    }
+
+    fn claim_keyed(root: &LaneRoot, sink: &dyn AuditSink, lane: &str, instance: &str) {
+        let params = ClaimParams {
+            repo: "ops".into(),
+            lane: lane.into(),
+            instance: instance.into(),
+            home: std::env::var("HOME").ok(),
+            linear_key: Some("ZER-1".into()),
+            ..Default::default()
+        };
+        claim_core(root, &params, Utc::now(), &StdFs, sink).unwrap();
+    }
+
+    /// Swap the lane's claim for a SUCCESSOR generation (same instance, fresh
+    /// claimed_at) by editing the lock JSON — the same-instance release+reclaim race
+    /// compressed into one step.
+    fn swap_generation(root: &LaneRoot, lane: &str) {
+        let path = root.lock_path("ops", lane);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut rec: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let bumped = (Utc::now() + chrono::Duration::seconds(7)).to_rfc3339();
+        rec["claimed_at"] = json!(bumped);
+        std::fs::write(&path, rec.to_string()).unwrap();
+    }
+
+    #[test]
+    fn release_generation_guard_unit() {
+        let home = std::env::var("HOME").unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("lane-gen-")
+            .tempdir_in(&home)
+            .unwrap();
+        let (root, sink) = setup(tmp.path());
+        claim_demo(&root, &sink);
+        let rec = record::read_claim(
+            &root.lock_path("ops", "demo"),
+            root.path(),
+            root.expected_uid(),
+            &StdFs,
+        )
+        .unwrap()
+        .unwrap();
+
+        // Stale generation ⇒ not_held refusal; the claim survives.
+        let stale = ReleaseParams {
+            repo: "ops".into(),
+            lane: "demo".into(),
+            instance: "a".into(),
+            expected_claimed_at: Some(rec.claimed_at + chrono::Duration::seconds(5)),
+        };
+        match release_core(&root, &stale, Utc::now(), &StdFs, &sink) {
+            Err(LaneError::Refused(RefusedReason::NotHeld)) => {}
+            Err(other) => panic!("wrong refusal: {other}"),
+            Ok(_) => panic!("stale generation must not release"),
+        }
+        assert!(root.lock_path("ops", "demo").exists(), "claim survives");
+
+        // Exact generation ⇒ released. (None-behavior is covered by every
+        // pre-existing release test in the suite.)
+        let exact = ReleaseParams {
+            repo: "ops".into(),
+            lane: "demo".into(),
+            instance: "a".into(),
+            expected_claimed_at: Some(rec.claimed_at),
+        };
+        let ok = release_core(&root, &exact, Utc::now(), &StdFs, &sink).unwrap();
+        assert!(ok.present);
+    }
+
+    #[test]
+    fn post_closeout_generation_swap_before_post_aborts_with_zero_creates() {
+        let home = std::env::var("HOME").unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("lane-swap-")
+            .tempdir_in(&home)
+            .unwrap();
+        let (root, sink) = setup(tmp.path());
+        write_close_config(root.path());
+        claim_keyed(&root, &sink, "demo", "a");
+
+        let mut transport = FakeLinear::new();
+        let root_dir = root.path().to_path_buf();
+        transport.on_first_preflight = Some(Box::new(move || {
+            // Interpose AFTER the publish lock + generation check #1, BEFORE any
+            // renew/post: the same-instance reclaim race.
+            let home = std::env::var("HOME").unwrap();
+            let r = LaneRoot::resolve(&root_dir, Some(&home), &StdFs).unwrap();
+            swap_generation(&r, "demo");
+        }));
+        let git = CompensationGit {
+            log: std::cell::RefCell::new(Vec::new()),
+            fail_delete: false,
+        };
+        let deps = CloseDeps {
+            git: &git,
+            op: &FakeOp,
+            transport: &transport,
+        };
+        let args = close_args("demo", "a", root.path());
+        let code = run_close_at(&args, Utc::now(), &deps);
+        assert_eq!(code, 1, "refusal, not success");
+        assert_eq!(
+            transport.creates.load(Ordering::SeqCst),
+            0,
+            "nothing was published"
+        );
+        assert!(
+            root.lock_path("ops", "demo").exists(),
+            "the successor claim is untouched"
+        );
+    }
+
+    #[test]
+    fn post_closeout_generation_swap_during_create_never_releases_successor() {
+        let home = std::env::var("HOME").unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("lane-swap2-")
+            .tempdir_in(&home)
+            .unwrap();
+        let (root, sink) = setup(tmp.path());
+        write_close_config(root.path());
+        claim_keyed(&root, &sink, "demo", "a");
+
+        let mut transport = FakeLinear::new();
+        let root_dir = root.path().to_path_buf();
+        transport.on_create = Some(Box::new(move || {
+            // Interpose between the final pre-post generation check and release:
+            // the create lands, then release must refuse the successor.
+            let home = std::env::var("HOME").unwrap();
+            let r = LaneRoot::resolve(&root_dir, Some(&home), &StdFs).unwrap();
+            swap_generation(&r, "demo");
+        }));
+        let git = CompensationGit {
+            log: std::cell::RefCell::new(Vec::new()),
+            fail_delete: false,
+        };
+        let deps = CloseDeps {
+            git: &git,
+            op: &FakeOp,
+            transport: &transport,
+        };
+        let args = close_args("demo", "a", root.path());
+        let code = run_close_at(&args, Utc::now(), &deps);
+        assert_eq!(code, 1, "generation-guarded release refuses");
+        assert_eq!(
+            transport.creates.load(Ordering::SeqCst),
+            1,
+            "exactly one create happened before the swap was detected"
+        );
+        assert!(
+            root.lock_path("ops", "demo").exists(),
+            "the successor claim survives the stale close"
+        );
+    }
+
+    #[test]
+    fn concurrent_post_closeouts_publish_at_most_once() {
+        let home = std::env::var("HOME").unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("lane-race-")
+            .tempdir_in(&home)
+            .unwrap();
+        let (root, sink) = setup(tmp.path());
+        write_close_config(root.path());
+        claim_keyed(&root, &sink, "demo", "a");
+
+        let transport = FakeLinear::new();
+        let root_path = root.path().to_path_buf();
+        let codes = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let transport = &transport;
+                let root_path = root_path.clone();
+                let codes = &codes;
+                scope.spawn(move || {
+                    let git = CompensationGit {
+                        log: std::cell::RefCell::new(Vec::new()),
+                        fail_delete: false,
+                    };
+                    let deps = CloseDeps {
+                        git: &git,
+                        op: &FakeOp,
+                        transport,
+                    };
+                    let args = close_args("demo", "a", &root_path);
+                    let code = run_close_at(&args, Utc::now(), &deps);
+                    codes.lock().unwrap().push(code);
+                });
+            }
+        });
+        let creates = transport.creates.load(Ordering::SeqCst);
+        assert!(creates <= 1, "at most one create, saw {creates}");
+        let codes = codes.into_inner().unwrap();
+        assert!(codes.contains(&0), "one racer released cleanly: {codes:?}");
+        assert!(
+            !root.lock_path("ops", "demo").exists(),
+            "the lane is released exactly once"
         );
     }
 }

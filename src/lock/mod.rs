@@ -143,6 +143,12 @@ pub struct ReleaseParams {
     pub repo: String,
     pub lane: String,
     pub instance: String,
+    /// Slice 4 generation guard: when set, the release only proceeds if the live
+    /// record's `claimed_at` equals this value — a caller that bound to a specific
+    /// claim GENERATION (the `close` composition) can never release a successor
+    /// claim of the same lane (same-instance release+reclaim race). `None` preserves
+    /// the plain `release` verb's behavior exactly.
+    pub expected_claimed_at: Option<DateTime<Utc>>,
 }
 
 /// Result of a release (`present` distinguishes a real removal from a no-op).
@@ -516,6 +522,15 @@ pub(crate) enum VerbData {
         worktree_removed: bool,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         skipped_missing_worktree: bool,
+        // Slice 4 gated-closeout fields (all None on a plain close):
+        #[serde(skip_serializing_if = "Option::is_none")]
+        closeout_draft: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        closeout_posted: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        closeout_already_posted: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        closeout_comment_url: Option<String>,
     },
     // Boxed: a `ClaimRecord` is far larger than the other variants (clippy large_enum_variant).
     Status(Box<StatusData>),
@@ -746,10 +761,40 @@ fn human_success(
                 expires_at.to_rfc3339()
             )
         }
-        ("close", Some(VerbData::Close { .. })) => match outcome {
-            Outcome::Released => format!("closed {lane}"),
-            _ => format!("{lane} was not held"),
-        },
+        (
+            "close",
+            Some(VerbData::Close {
+                closeout_draft,
+                closeout_posted,
+                closeout_already_posted,
+                closeout_comment_url,
+                ..
+            }),
+        ) => {
+            // Draft-preview mode: the draft IS the output (fenced), nothing closed.
+            if closeout_posted.is_none() && closeout_already_posted.is_none() {
+                if let Some(draft) = closeout_draft {
+                    return format!(
+                        "---\n{}\n---\ndraft only — not posted, nothing closed; to post: lane close {lane} --repo <repo> --post-closeout",
+                        draft.trim_end()
+                    );
+                }
+            }
+            let closeout = if closeout_already_posted == &Some(true) {
+                "; closeout already posted (marker found)".to_string()
+            } else if closeout_posted == &Some(true) {
+                match closeout_comment_url.as_deref() {
+                    Some(url) => format!("; closeout posted ({url})"),
+                    None => "; closeout posted".to_string(),
+                }
+            } else {
+                String::new()
+            };
+            match outcome {
+                Outcome::Released => format!("closed {lane}{closeout}"),
+                _ => format!("{lane} was not held"),
+            }
+        }
         ("close", None) => format!("{lane} was not held"),
         (
             "pull",
@@ -1052,6 +1097,8 @@ fn run_release_at(args: &ReleaseArgs, now: DateTime<Utc>) -> i32 {
             repo: args.repo.clone(),
             lane: args.lane.clone(),
             instance,
+            // The plain verb releases whatever generation the owner currently holds.
+            expected_claimed_at: None,
         };
         let s = renew_release::release_core(&root, &params, now, &fs, &sink)?;
         let outcome = if s.present {
