@@ -20,8 +20,8 @@ pub fn render(board: &Board) -> String {
     } else {
         let _ = writeln!(
             out,
-            "{:<13} {:<18} {:<13} {:<18} {:<12} {:<30} {:<12} {:<16} {}",
-            "KEY", "LANE", "REPO", "STALE", "LIVE", "BRANCH", "GATE", "STATE", "TITLE"
+            "{:<13} {:<18} {:<13} {:<18} {:<12} {:<30} {:<12} {:<16} TITLE",
+            "KEY", "LANE", "REPO", "STALE", "LIVE", "BRANCH", "GATE", "STATE"
         );
         for r in &board.rows {
             let key = match &r.linear_key {
