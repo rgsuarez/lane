@@ -4,12 +4,15 @@ Durable rules for any agent working in this repo. Read before editing. The full 
 is in `docs/lane_SPEC.md` and the master plan
 (`~/.claude/plans/plan-mode-build-the-gleaming-donut.md`).
 
-**Current status & next work (read on cold boot):** as-built = Slices 0a/1/2 (offline
-locking core; `main` @ the latest commit; 117 tests). Full context + the next steps are in
-`session-journals/2026-06-21-002-NEXT-SESSION-HANDOFF.md` (build journal: the `…-001-…`
-file). Next slice = **3 (lifecycle + pairing + git-worktree automation + zeos skill-wrap)**.
-The north star (a local app that *replaces Vantage in daily orchestration*) is **not yet
-realized** — much remains (Slices 0b/3/4/5; Vantage exit criteria 0/6).
+**Current status & next work (read on cold boot):** as-built = Slices 0a/1/2/3/**3.5**
+(offline locking core; git worktree adapter + `start`/`close`/`handoff`; commit guard
+`check` + `hook`, ZER-84; 227 tests at the 3.5 baseline). lane was **adopted machine-wide
+2026-07-07** (Linear ZER-82; consumer doctrine in eleetai CLAUDE.md § MULTI-AGENT
+WORKTREE POLICY). Trust `git log` + `session-journals/` (newest first) over any stale
+pointer. Next slice = **4 (Linear read adapter + 1Password + pairing residue from 3)**,
+then 0b/5. The north star (a local app that *replaces Vantage in daily orchestration*) is
+**not yet realized** — Vantage exit criteria remain open. Known flake quarantine: Linear
+ZER-83 (`tests/lock_concurrency.rs` release-profile timing) — do not entangle.
 
 ## North star
 
@@ -83,12 +86,39 @@ The core (`src/lock/`) has no dependency on either.
 
 ## Exit codes & JSON envelope
 
-`0` ok (incl. `release`/`close`/`status` of an absent lane). `1` refused
+`0` ok (incl. `release`/`close`/`status` of an absent lane, and `hook status`/`hook
+uninstall` of a not-installed repo). `1` refused
 (`active_held`/`not_owner`/`target_overlap`/`mutex_busy`/`expired`/`not_held`/
-`dirty_worktree`). `2` `identity`/`malformed`/`io`/`non_local_root` (plus Clap usage
-errors, human-only). Under `--json`, exactly one versioned envelope is the sole stdout for
-every post-parse exit path. `LaneError::{exit_code,reason}` is the single authoritative
-mapping (`src/error.rs`).
+`dirty_worktree`/`uncovered`/`foreign_owner`/`no_identity`/`hook_compose_refused`).
+`2` `identity`/`malformed`/`io`/`non_local_root` (plus Clap usage errors, human-only).
+Under `--json`, exactly one versioned envelope is the sole stdout for every post-parse
+exit path. `LaneError::{exit_code,reason}` is the single authoritative mapping
+(`src/error.rs`); context-rich refusals ride `LaneError::RefusedMsg { reason, msg }`
+(closed reason code in the envelope, composed fix text on human stderr) — never a second
+print path.
+
+## Commit guard (Slice 3.5 — `check` + `hook`)
+
+- **`lane check` is read-only by law:** scans via `list_core` (guarded reads), zero
+  audit interaction, zero mutation, spawns nothing, fully offline. Default scan = ALL
+  namespaces (claim targets are machine-global paths; a worktree's toplevel basename is
+  NOT the repo namespace). Identity is required — absence refuses `no_identity` (exit 1),
+  an invalid identity stays `identity` (exit 2). Coverage is DIRECTIONAL
+  (`Target::covers`: claim equal-or-ancestor of path) with the `target_normalized` →
+  `target` fallback mirroring `scan_overlap`.
+- **`lane hook` lives outside the locking core** (like `src/git/` + `src/lifecycle.rs`):
+  takes NO core locks, never touches `$LANE_ROOT`, and the generated hook NEVER
+  auto-claims. Compose, never clobber: marked-block append/replace only
+  (`# >>> lane hook vN >>>` … `# <<< lane hook <<<`); managed `core.hooksPath`, symlink,
+  dormant (non-executable), non-text, oversize, or marker-damaged files are refused
+  (`hook_compose_refused`) with manual instructions. Writes are temp-in-same-dir +
+  chmod 0755 + atomic rename. The canonical script is `BLOCK_TEMPLATE` in `src/hook.rs`;
+  in a composed hook every path `return`s (never `exit 0` — that would skip the host's
+  later gates). Modes: `git config lane.hook.mode` = `advise` (default) | `enforce`;
+  `LANE_HOOK_BYPASS=1` bypasses LOUDLY; missing-binary/exit-2 postures are
+  warn-and-pass in advise, fail-closed in enforce — never silent-open. Residual to keep
+  documented: `git commit --no-verify` skips pre-commit (consumer doctrine forbids it
+  for agents). Rollout doctrine: `docs/HOOK_ROLLOUT.md`.
 
 ## Secrets policy
 

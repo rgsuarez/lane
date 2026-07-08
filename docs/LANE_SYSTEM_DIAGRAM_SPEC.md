@@ -48,30 +48,27 @@ Use these styles consistently:
 
 1. The private GitHub repository is `https://github.com/rgsuarez/lane`.
 2. The authoritative branch is `main`.
-3. The as-built commit for this specification is `e9f30b1`.
+3. The as-built baseline for this specification is Slice 3.5 (branched from `main` @ `b5d1361`).
 4. Slice 0a delivered the architecture and Vantage-exit documents.
 5. Slice 1 delivered the read-only board framework.
 6. Slice 2 delivered the offline locking and audit core.
-7. The current CLI implements `board`.
-8. The current CLI implements `claim`.
-9. The current CLI implements `renew`.
-10. The current CLI implements `release`.
-11. The current CLI implements `status`.
-12. The current CLI implements `list`.
-13. The codebase has 117 passing tests at the as-built baseline.
-14. The core has no HTTP client.
-15. The core has no database.
-16. The core has no async runtime.
-17. The core has no daemon.
-18. The core has no background process.
-19. The core has no live Linear client.
-20. The core has no live Git worktree adapter.
-21. The core has no live 1Password integration.
-22. The core has no tmux session spawning.
-23. The core has no advisor/executor pairing runtime.
-24. The core has no live Overseer integration.
-25. The core has no Vantage migration executable.
-26. The core has no cross-host locking.
+7. Slice 3 delivered the git worktree adapter, the `start`/`close` composition verbs, `handoff`, and the opt-in live board worktree probe.
+8. Slice 3.5 delivered the commit guard: the read-only `check` coverage verb and the `hook` pre-commit family (ZER-84).
+9. The current CLI implements `board`, `claim`, `renew`, `handoff`, `release`, `status`, `list`, `check`, `start`, `close`, and `hook print|install|status|uninstall`.
+10. The codebase has 227 passing tests at the as-built baseline.
+11. The core has no HTTP client.
+12. The core has no database.
+13. The core has no async runtime.
+14. The core has no daemon.
+15. The core has no background process.
+16. The core has no live Linear client.
+17. The Git adapter (worktree/branch/hooks-dir/config plumbing) lives OUTSIDE the locking core; the core itself never spawns git.
+18. The core has no live 1Password integration.
+19. The core has no tmux session spawning.
+20. The core has no advisor/executor pairing runtime.
+21. The core has no live Overseer integration.
+22. The core has no Vantage migration executable.
+23. The core has no cross-host locking.
 
 ## 3. Source-of-truth ownership
 
@@ -137,6 +134,8 @@ Use these styles consistently:
 7. `lane board [--repo <repo>]` (`--worktrees git` opt-in live worktree probe)
 8. `lane start <lane> --repo <repo> --git-repo <path>` (Slice 3: composition verb)
 9. `lane close <lane> --repo <repo> [--remove-worktree]` (Slice 3: composition verb)
+10. `lane check [--path <p>] [--repo <repo>]` (Slice 3.5: read-only claim-coverage verdict; identity required, all-namespace scan by default)
+11. `lane hook print|install|status|uninstall` (Slice 3.5: git pre-commit guard family; composes with foreign hooks, refuses managed `core.hooksPath` dirs with a paste-in snippet; lane's first commit-time-enforcement surface)
 
 ### 5.2 Planned commands
 
@@ -202,10 +201,16 @@ Closed reason values:
 5. `expired`
 6. `not_held`
 7. `dirty_worktree`
-8. `identity`
-9. `malformed`
-10. `non_local_root`
-11. `io`
+8. `uncovered` (Slice 3.5: `check` — no active caller-owned claim covers the path)
+9. `foreign_owner` (Slice 3.5: `check` — a covering active claim belongs to another instance)
+10. `no_identity` (Slice 3.5: `check` — no `--instance`/`LANE_INSTANCE`; absence refuses, invalid stays `identity`)
+11. `hook_compose_refused` (Slice 3.5: `hook` — managed hooksPath / symlink / dormant / non-text / oversize / damaged markers)
+12. `identity`
+13. `malformed`
+14. `non_local_root`
+15. `io`
+
+Context-rich refusals (`uncovered`, `foreign_owner`, `no_identity`, `hook_compose_refused`) are carried by `LaneError::RefusedMsg { reason, msg }`: the envelope `reason` stays the closed code above; the human-mode stderr message is composed at the call site with real values (the exact fix command).
 
 ## 6. Local state root
 
@@ -882,27 +887,32 @@ Rules:
 18. Audit engine
 19. Audit reconciler
 20. Board assembler
+21. Git adapter (Slice 3: worktree/branch/hooks-dir/config plumbing, bounded-wait spawns)
+22. Lifecycle composer (Slice 3: `start`/`close` orchestration over core + git adapter)
+23. Coverage engine (Slice 3.5: `check` — directional target coverage over guarded reads)
+24. Hook manager (Slice 3.5: `hook print|install|status|uninstall` — marker-block composition)
 
 ### 24.3 Local state nodes
 
-21. Claim files
-22. Temporary claim files
-23. Lane mutex files
-24. Target mutex file
-25. Audit log
-26. Audit recovery fragments
-27. Config file
+25. Claim files
+26. Temporary claim files
+27. Lane mutex files
+28. Target mutex file
+29. Audit log
+30. Audit recovery fragments
+31. Config file
+32. Consumer repo pre-commit hook file (Slice 3.5: lane-marked block; NOT under `LANE_ROOT`)
 
 ### 24.4 External system nodes
 
-28. Linear
-29. GitHub
-30. 1Password
-31. Overseer
-32. Git worktrees
-33. Vantage archive
-34. Other-host `lane`
-35. Future shared lock service
+33. Linear
+34. GitHub
+35. 1Password
+36. Overseer
+37. Git worktrees
+38. Vantage archive
+39. Other-host `lane`
+40. Future shared lock service
 
 ## 25. Implemented edges
 
@@ -948,6 +958,17 @@ Use solid green arrows.
 38. Release engine → JSON/human renderer.
 39. Status/list engine → JSON/human renderer.
 40. JSON/human renderer → executor agent.
+41. `lane start`/`lane close` → lifecycle composer (Slice 3).
+42. Lifecycle composer → claim/renew/release engines (no core mutex held across a git spawn).
+43. Lifecycle composer → git adapter → Git worktrees (Slice 3).
+44. Board assembler → git adapter (Slice 3: opt-in `--worktrees git` live probe).
+45. `lane check` → coverage engine (Slice 3.5).
+46. Coverage engine → target canonicalizer.
+47. Coverage engine → shared record reader (all namespaces by default; zero audit, zero mutation).
+48. `lane hook install|status|uninstall` → hook manager (Slice 3.5).
+49. Hook manager → git adapter (toplevel, hooks dir, `core.hooksPath`, `lane.hook.mode` config).
+50. Hook manager → consumer repo pre-commit hook file (atomic temp+rename; marker-block surgery only).
+51. Consumer `git commit` → installed pre-commit hook → `lane check` (advise warns, enforce fails closed; `LANE_HOOK_BYPASS=1` loud bypass).
 
 ## 26. Planned edges
 
@@ -955,19 +976,17 @@ Use dashed blue arrows.
 
 1. zeos → `lane` CLI.
 2. Advisor agent → `lane pair`.
-3. Board assembler → Git worktrees.
-4. Board assembler → Overseer.
-5. Board assembler → Linear.
-6. `lane start` → Git worktrees.
-7. Git worktrees → GitHub branch and PR.
-8. GitHub → Linear status integration.
-9. `lane` Linear adapter → 1Password.
-10. 1Password → temporary child environment.
-11. `lane close` → operator-gated Linear write.
-12. Vantage archive → migration tool.
-13. Migration tool → Linear.
-14. Multiple local `lane` installations → read-only aggregate board.
-15. Multiple hosts → future shared lock service, only if approved.
+3. Board assembler → Overseer.
+4. Board assembler → Linear.
+5. Git worktrees → GitHub branch and PR.
+6. GitHub → Linear status integration.
+7. `lane` Linear adapter → 1Password.
+8. 1Password → temporary child environment.
+9. `lane close` → operator-gated Linear write.
+10. Vantage archive → migration tool.
+11. Migration tool → Linear.
+12. Multiple local `lane` installations → read-only aggregate board.
+13. Multiple hosts → future shared lock service, only if approved.
 
 ## 27. Forbidden edges
 

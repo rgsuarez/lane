@@ -41,7 +41,9 @@ use crate::model::{ClaimStatus, Role};
 /// Map a git-adapter error to the authoritative error type. A dirty-worktree refusal is
 /// a safe exit-1 refusal (`dirty_worktree`); every other git failure (plumbing, timeout,
 /// spawn, precheck, flag-smuggling) is an exit-2 io-class error carrying the detail.
-fn git_to_lane(e: GitError) -> LaneError {
+/// `pub(crate)`: the hook composition layer (`src/hook.rs`) maps its git faults through
+/// the SAME single translation — never a second mapping.
+pub(crate) fn git_to_lane(e: GitError) -> LaneError {
     match e {
         GitError::DirtyWorktree { .. } => LaneError::Refused(RefusedReason::DirtyWorktree),
         other => LaneError::Io(std::io::Error::other(other.to_string())),
