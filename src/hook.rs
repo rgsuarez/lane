@@ -13,12 +13,15 @@
 //! (`core.hooksPath` set — husky et al.) is refused with the exact snippet to paste,
 //! because tracked hook files are repo content (PR territory) and generated shim dirs
 //! get regenerated. A foreign `pre-commit` in a native hooks dir is composed by
-//! APPENDING a marked block (lane block LAST — hooks AND-compose, so order only decides
-//! which refusal prints first, and the repo owner's gate order is preserved); re-install
-//! replaces exactly the marked block (idempotent; also the version-upgrade path); a
-//! symlinked, non-executable, non-UTF-8, oversize, or marker-damaged file is refused
-//! untouched. Every write is temp-in-same-dir + chmod 0755 + atomic rename, so a racing
-//! `git commit` never execs a half-written hook.
+//! APPENDING a marked block (lane block LAST, preserving the repo owner's gate order —
+//! but hooks only AND-compose when every earlier gate FALLS THROUGH: a success-path
+//! early `exit 0` above the block makes it unreachable dead code (ZER-90), so install
+//! and status WARN on that heuristically, and doctrine places PASTED blocks after the
+//! secret scan and before any early-exit gate); re-install replaces exactly the marked
+//! block (idempotent; also the version-upgrade path); a symlinked, non-executable,
+//! non-UTF-8, oversize, or marker-damaged file is refused untouched. Every write is
+//! temp-in-same-dir + chmod 0755 + atomic rename, so a racing `git commit` never execs
+//! a half-written hook.
 
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -33,7 +36,9 @@ use crate::lifecycle::git_to_lane;
 use crate::lock::{emit, validate_name, CommandError, Outcome, VerbData};
 
 /// Version stamped into the marker line; parsed back by `status` and the upgrade path.
-pub const HOOK_VERSION: u32 = 1;
+/// v1 → v2 (ZER-91): identity pre-check with distinct no-identity messaging, and
+/// enforce-mode exit classes (1 = coverage violation, 2 = environment).
+pub const HOOK_VERSION: u32 = 2;
 /// Version-agnostic detection prefix (any `# >>> lane hook vN >>>`).
 const MARKER_OPEN_PREFIX: &str = "# >>> lane hook v";
 const MARKER_OPEN_SUFFIX: &str = " >>>";
@@ -47,11 +52,24 @@ const MODE_KEY: &str = "lane.hook.mode";
 /// THROUGH to the host script's remaining gates — never `exit 0` from inside a composed
 /// hook (that would skip a later gitleaks/ci gate). `sh -e`-safe (every command is an
 /// if-condition, `|| true`, assignment, or echo — husky's loader runs `sh -e`) and
-/// `set -u`-safe (only `${LANE_HOOK_BYPASS:-}` may be unset). No `local` (not POSIX);
-/// `lane_`-prefixed names avoid host-variable collisions.
-const BLOCK_TEMPLATE: &str = r#"# >>> lane hook v1 >>>
+/// `set -u`-safe (only `${LANE_HOOK_BYPASS:-}` / `${LANE_INSTANCE:-}` may be unset).
+/// No `local` (not POSIX); `lane_`-prefixed names avoid host-variable collisions.
+///
+/// v2 (ZER-91): identity is pre-checked — the hook's only identity source is
+/// `$LANE_INSTANCE` (it never passes `--instance`), so an unset/empty value is
+/// diagnosed as IDENTITY PROPAGATION, never mislabeled "not covered". Enforce-mode
+/// exit classes follow the host taxonomy (eleetai's documented contract):
+/// 1 = genuine coverage violation (`lane check` exit 1: uncovered / foreign owner);
+/// 2 = environment (lane not on PATH, no identity, `lane check` exit ≥ 2) — the
+/// trailer `|| exit $?` propagates the class to the host hook. Advise mode never
+/// blocks and never passes silently; the bypass is LOUD in both modes.
+const BLOCK_TEMPLATE: &str = r#"# >>> lane hook v2 >>>
 # lane pre-commit guard - managed by `lane hook`; do not edit inside the markers.
+# Placement: keep this block AFTER any secret-scan gate but BEFORE any gate that
+# can exit 0 early - an early exit above this block makes the guard unreachable.
 # Mode: `git config lane.hook.mode` (advise | enforce; default advise).
+# Enforce exits: 1 = commit not covered by a claim (violation); 2 = guard cannot
+# run (lane not on PATH / no identity / integrity-io). Advise never blocks.
 # Bypass once (loud): LANE_HOOK_BYPASS=1 git commit ...
 lane_hook_guard() {
   if [ "${LANE_HOOK_BYPASS:-}" = "1" ]; then
@@ -71,9 +89,20 @@ lane_hook_guard() {
     if [ "$lane_mode" = "enforce" ]; then
       echo "lane-hook: BLOCKED: 'lane' not found on PATH and lane.hook.mode=enforce." >&2
       echo "lane-hook: install lane, or bypass once: LANE_HOOK_BYPASS=1 git commit ..." >&2
-      return 1
+      return 2
     fi
     echo "lane-hook: WARNING: 'lane' not found on PATH; claim guard skipped (advise mode)" >&2
+    return 0
+  fi
+  if [ -z "${LANE_INSTANCE:-}" ]; then
+    if [ "$lane_mode" = "enforce" ]; then
+      echo "lane-hook: BLOCKED: no caller identity (LANE_INSTANCE is not set); claim coverage cannot be verified." >&2
+      echo "lane-hook: if you hold a covering claim, identity did not reach this shell; fix: export LANE_INSTANCE=<your-instance>" >&2
+      echo "lane-hook: bypass once: LANE_HOOK_BYPASS=1 git commit ..." >&2
+      return 2
+    fi
+    echo "lane-hook: WARNING: no caller identity (LANE_INSTANCE unset); claim coverage not verified (advise mode; commit allowed)." >&2
+    echo "lane-hook: if you hold a covering claim, identity did not reach this shell; fix: export LANE_INSTANCE=<your-instance>" >&2
     return 0
   fi
   if lane check --path "$PWD"__LANE_REPO__ >/dev/null; then
@@ -84,11 +113,12 @@ lane_hook_guard() {
   if [ "$lane_mode" = "enforce" ]; then
     if [ "$lane_rc" -eq 1 ]; then
       echo "lane-hook: BLOCKED: commit path not covered by your active lane claim (fix command above)." >&2
-    else
-      echo "lane-hook: BLOCKED: lane check failed (exit $lane_rc, integrity/io) under enforce mode." >&2
+      echo "lane-hook: bypass once: LANE_HOOK_BYPASS=1 git commit ..." >&2
+      return 1
     fi
+    echo "lane-hook: BLOCKED: lane check failed (exit $lane_rc, integrity/io) under enforce mode." >&2
     echo "lane-hook: bypass once: LANE_HOOK_BYPASS=1 git commit ..." >&2
-    return 1
+    return 2
   fi
   if [ "$lane_rc" -eq 1 ]; then
     echo "lane-hook: WARNING: commit path not covered by an active lane claim (advise mode; commit allowed)." >&2
@@ -97,7 +127,7 @@ lane_hook_guard() {
   fi
   return 0
 }
-lane_hook_guard || exit 1
+lane_hook_guard || exit $?
 # <<< lane hook <<<
 "#;
 
@@ -180,6 +210,49 @@ fn only_scaffolding(lines: &[&str]) -> bool {
     lines
         .iter()
         .all(|l| l.trim().is_empty() || l.trim_start().starts_with("#!"))
+}
+
+/// Warning shared by install/status when a gate above the lane block can succeed-exit
+/// before the block runs (ZER-90: an unreachable guard is worse than none — status
+/// reports "installed" while nothing enforces).
+const UNREACHABLE_WARNING: &str = "a gate above the lane block has a success-path early exit (`exit 0`), so the lane block may be UNREACHABLE; move the block above that gate (keep it after any secret scan) and verify with an uncovered test commit (expect a lane-hook line)";
+
+/// Naive success-path early-exit detector (ZER-90): flags a bare `exit` line, and any
+/// `exit 0` command fragment — including the idiomatic one-liners `[ … ] && exit 0`,
+/// `cmd || exit 0`, and `cmd; exit 0` (fragments split on `&`/`|`/`;`), plus trailing
+/// comments (eleetai's `exit 0  # Nothing relevant staged.`). Failure exits (`exit 1`,
+/// `cmd || exit`) are NOT flagged — a failing gate refuses the commit anyway, so a
+/// block below it is morally moot. Line-lexical by design (heredoc/string content and
+/// conditional exits are indistinguishable without parsing sh): this feeds a WARNING,
+/// never a refusal — the acceptance smoke test is authoritative.
+fn has_early_success_exit(lines: &[&str]) -> bool {
+    fn exit0_fragment(frag: &str) -> bool {
+        let t = frag.trim();
+        t == "exit 0"
+            || t.strip_prefix("exit 0")
+                .is_some_and(|rest| rest.starts_with([' ', '\t', ';']))
+    }
+    lines.iter().any(|l| {
+        let t = l.trim();
+        if t.starts_with('#') {
+            return false; // whole-line comment (fragments of it would false-positive)
+        }
+        t == "exit" || t.split(['&', '|', ';']).any(exit0_fragment)
+    })
+}
+
+/// The single ZER-90 unreachability scan shared by install and status (one detector, so
+/// the two surfaces can never drift): success-path early exits count only ABOVE the
+/// lane block — or anywhere when no block exists yet, since an append lands below every
+/// line. Damaged markers return `None` (the caller surfaces damage on its own path).
+fn unreachable_warning(text: &str) -> Option<&'static str> {
+    let lines: Vec<&str> = text.lines().collect();
+    let scan = match find_block(&lines) {
+        Ok(Some((open, _, _))) => &lines[..open],
+        Ok(None) => &lines[..],
+        Err(_) => return None,
+    };
+    has_early_success_exit(scan).then_some(UNREACHABLE_WARNING)
 }
 
 /// Classify raw `pre-commit` contents (pure; `None` = no file).
@@ -404,7 +477,7 @@ pub(crate) fn run_install_at(args: &HookInstallArgs, runner: &dyn GitRunner) -> 
         {
             let manager = detect_manager(&hooks_path);
             return Err(compose_refused(format!(
-                "core.hooksPath = '{hooks_path}' is set — {manager} manages hooks in {top}; lane will not write into a managed hooks dir.\nAppend this block at the END of the managed pre-commit hook (after existing gates) via your normal PR flow:\n\n{}",
+                "core.hooksPath = '{hooks_path}' is set — {manager} manages hooks in {top}; lane will not write into a managed hooks dir.\nPaste this block into the managed pre-commit hook via your normal PR flow, placing it immediately AFTER your secret-scan gate (first, if none) and BEFORE any gate that can exit early — an early `exit 0` above the block makes it unreachable dead code.\nThen verify: `git commit --allow-empty -m smoke` with LANE_INSTANCE unset must print a lane-hook line (drop the smoke commit afterwards):\n\n{}",
                 render_block(args.repo.as_deref()),
                 top = top.display(),
             )));
@@ -427,14 +500,24 @@ pub(crate) fn run_install_at(args: &HookInstallArgs, runner: &dyn GitRunner) -> 
                     classify(Some(spliced.as_bytes())),
                     HookFileState::Composed { .. }
                 );
+                // ZER-90: a re-install (upgrade) is the moment an operator would
+                // re-place a dead block — warn if a gate above it can exit 0 early.
+                warning = unreachable_warning(&spliced).map(String::from);
                 (spliced, composed, true)
             }
             HookFileState::ForeignOnly => {
                 let text = String::from_utf8(existing.unwrap()).expect("classified as UTF-8");
+                let mut notes: Vec<&str> = Vec::new();
                 if text.lines().any(|l| l.trim_start().starts_with("exec ")) {
-                    warning = Some(
-                        "existing hook appears to exec another program; the appended lane block may be unreachable — verify with a test commit".into(),
-                    );
+                    notes.push("existing hook appears to exec another program; the appended lane block may be unreachable — verify with a test commit");
+                }
+                // ZER-90: the appended block lands BELOW any existing early exit
+                // (no markers yet, so the shared scan covers the whole foreign body).
+                if let Some(w) = unreachable_warning(&text) {
+                    notes.push(w);
+                }
+                if !notes.is_empty() {
+                    warning = Some(notes.join("; also: "));
                 }
                 let sep = if text.ends_with('\n') { "" } else { "\n" };
                 (format!("{text}{sep}{block}"), true, false)
@@ -528,7 +611,16 @@ pub(crate) fn run_status_at(args: &HookStatusArgs, runner: &dyn GitRunner) -> i3
                 match classify(Some(&bytes)) {
                     HookFileState::Absent => (false, None, false),
                     HookFileState::LaneOnly { version } => (true, Some(version), false),
-                    HookFileState::Composed { version } => (true, Some(version), true),
+                    HookFileState::Composed { version } => {
+                        // ZER-90: report a possibly-unreachable block (an existing
+                        // symlink/dormant warning outranks this heuristic one).
+                        if warning.is_none() {
+                            // Safe: classify only returns Composed for valid UTF-8.
+                            let text = std::str::from_utf8(&bytes).expect("classified as UTF-8");
+                            warning = unreachable_warning(text).map(String::from);
+                        }
+                        (true, Some(version), true)
+                    }
                     HookFileState::ForeignOnly => (false, None, true),
                     HookFileState::Damaged(d) => {
                         warning = Some(format!("lane markers are damaged: {d}"));
@@ -633,11 +725,14 @@ mod tests {
     fn render_shapes() {
         let script = render_script(None);
         assert!(script.starts_with("#!/bin/sh\n"));
-        assert!(script.contains("# >>> lane hook v1 >>>"));
+        assert!(script.contains("# >>> lane hook v2 >>>"));
         assert!(script.contains(MARKER_CLOSE));
         assert!(script.contains(r#"lane check --path "$PWD""#));
         assert!(!script.contains("__LANE_REPO__"));
         assert!(!script.contains("--repo"));
+        // The block carries its own placement law (ZER-90) and never the dead guidance.
+        assert!(script.contains("BEFORE any gate"));
+        assert!(!script.contains("at the END"));
 
         let snippet = render_block(Some("eleetai"));
         assert!(!snippet.starts_with("#!"));
@@ -645,7 +740,91 @@ mod tests {
         // One well-formed pair, and it classifies as ours alone.
         assert_eq!(
             classify(Some(render_script(None).as_bytes())),
-            HookFileState::LaneOnly { version: 1 }
+            HookFileState::LaneOnly { version: 2 }
+        );
+    }
+
+    #[test]
+    fn template_marker_matches_hook_version() {
+        // The marker literal and the const must never drift (status/upgrade parse it).
+        assert!(BLOCK_TEMPLATE.starts_with(&format!(
+            "{MARKER_OPEN_PREFIX}{HOOK_VERSION}{MARKER_OPEN_SUFFIX}\n"
+        )));
+    }
+
+    #[test]
+    fn early_success_exit_detector() {
+        assert!(has_early_success_exit(&["exit 0"]));
+        assert!(has_early_success_exit(&[
+            "  exit 0  # Nothing relevant staged."
+        ]));
+        assert!(has_early_success_exit(&["exit 0;"]));
+        assert!(has_early_success_exit(&["exit"]));
+        // Idiomatic one-liner short-circuits are the common real-world form.
+        assert!(has_early_success_exit(&[
+            r#"[ -z "$(git diff --cached --name-only)" ] && exit 0"#
+        ]));
+        assert!(has_early_success_exit(&[
+            "optional_gate || exit 0  # tolerated"
+        ]));
+        assert!(has_early_success_exit(&["cleanup; exit 0"]));
+        assert!(!has_early_success_exit(&["exit 1"]));
+        assert!(!has_early_success_exit(&["run_check || exit"]));
+        assert!(!has_early_success_exit(&["# exit 0"]));
+        assert!(!has_early_success_exit(&[
+            "# a comment about cmd && exit 0"
+        ]));
+        assert!(!has_early_success_exit(&["exit 0all"]));
+        assert!(!has_early_success_exit(&["cmd >/dev/null 2>&1"]));
+        assert!(!has_early_success_exit(&["lane_hook_guard || exit $?"]));
+        assert!(!has_early_success_exit(&[]));
+        // The v2 block itself must never trip the detector (status scans above it only,
+        // but install scans a whole foreign body that could one day contain our text).
+        let block = render_block(None);
+        assert!(!has_early_success_exit(&block.lines().collect::<Vec<_>>()));
+    }
+
+    #[test]
+    fn unreachable_warning_scans_above_block_or_whole_foreign_body() {
+        // Early exit ABOVE the block → warns.
+        let dead = format!("#!/bin/sh\nfoo && exit 0\n{}", render_block(None));
+        assert_eq!(unreachable_warning(&dead), Some(UNREACHABLE_WARNING));
+        // Early exit only INSIDE/BELOW the block region → clean (the block's own
+        // trailer and anything after it do not gate the block).
+        let live = format!("#!/bin/sh\necho scan\n{}", render_block(None));
+        assert_eq!(unreachable_warning(&live), None);
+        // No block yet (ForeignOnly): the whole body is scanned — an append would
+        // land below the exit.
+        assert_eq!(
+            unreachable_warning("#!/bin/sh\nexit 0\n"),
+            Some(UNREACHABLE_WARNING)
+        );
+        assert_eq!(unreachable_warning("#!/bin/sh\necho ok\n"), None);
+        // Damaged markers: the caller's damage path owns the message.
+        assert_eq!(
+            unreachable_warning("# >>> lane hook v1 >>>\nexit 0\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn v1_block_upgrades_to_v2_via_splice() {
+        let foreign = "#!/bin/sh\necho secret-scan >&2\n";
+        let v1 = "# >>> lane hook v1 >>>\nold_guard() { return 0; }\nold_guard || exit 1\n# <<< lane hook <<<\n";
+        let file = format!("{foreign}{v1}");
+        assert_eq!(
+            classify(Some(file.as_bytes())),
+            HookFileState::Composed { version: 1 },
+            "v1 detection keeps working"
+        );
+        let out = splice(&file, &render_block(None)).unwrap();
+        assert!(out.starts_with(foreign), "foreign bytes preserved");
+        assert!(out.contains("# >>> lane hook v2 >>>"));
+        assert!(!out.contains("# >>> lane hook v1 >>>"));
+        assert!(!out.contains("old_guard"), "old body fully replaced");
+        assert_eq!(
+            classify(Some(out.as_bytes())),
+            HookFileState::Composed { version: 2 }
         );
     }
 
@@ -659,7 +838,7 @@ mod tests {
         let composed = format!("#!/bin/sh\necho foreign\n{}", render_block(None));
         assert_eq!(
             classify(Some(composed.as_bytes())),
-            HookFileState::Composed { version: 1 }
+            HookFileState::Composed { version: 2 }
         );
         let damaged = "#!/bin/sh\n# >>> lane hook v1 >>>\n";
         assert!(matches!(
@@ -699,7 +878,7 @@ mod tests {
         assert_eq!(once, twice, "splice is idempotent");
         assert_eq!(
             classify(Some(once.as_bytes())),
-            HookFileState::Composed { version: 1 }
+            HookFileState::Composed { version: 2 }
         );
     }
 
@@ -721,6 +900,7 @@ mod tests {
     #[test]
     fn parse_version_and_manager_detection() {
         assert_eq!(parse_version("# >>> lane hook v1 >>>"), Some(1));
+        assert_eq!(parse_version("# >>> lane hook v2 >>>"), Some(2));
         assert_eq!(parse_version("# >>> lane hook v12 >>>"), Some(12));
         assert_eq!(parse_version("# >>> lane hook vx >>>"), None);
         assert_eq!(detect_manager(".husky/_"), "husky");
