@@ -1,6 +1,10 @@
 //! Slice 2 — multi-PROCESS concurrency (real `lane` processes, not in-process threads
 //! sharing state). Proves exactly-one-winner, overlap/expired-takeover races, mutex
 //! contention, OS crash-release on SIGKILL, and non-interleaved audit appends.
+//!
+//! The hold-dependent tests synchronize on OBSERVABLE STATE via the ZER-83 handshake
+//! (`spawn_holding` + `LANE_TEST_HOLD_FILE` markers), never on how fast a binary runs —
+//! deterministic under any optimization level (`cargo test --release` is a stated gate).
 
 mod common;
 
@@ -9,7 +13,7 @@ use common::*;
 use std::fs::{File, TryLockError};
 use std::path::Path;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const N: usize = 8;
 
@@ -140,22 +144,30 @@ fn audit_appends_never_interleave() {
     );
 }
 
+/// Spawn a claim-holder for `lane` on repo `ops`, wait for its held signal (a liveness
+/// bound on process spawn, not a race window), and assert the lane mutex is genuinely
+/// held — the shared preamble of every hold-dependent test, in one place so the bound
+/// and the invariant can never drift between them.
+fn spawn_held(r: &Path, lane: &str) -> HoldingChild {
+    let holder = spawn_holding(r, "holder", &["claim", lane, "--repo", "ops", "--json"]);
+    assert!(
+        holder.wait_held(Duration::from_secs(10)),
+        "holder signaled it acquired the mutex (liveness bound, not a race window)"
+    );
+    assert_lane_mutex_held_now(r, "ops", lane);
+    holder
+}
+
 #[test]
 fn mutex_contention_reports_busy() {
     let root = temp_root();
     let r = root.path();
-    // Holder keeps the lane mutex 4s (> the ~3s contender window).
-    let mut holder = spawn_holding(
-        r,
-        "holder",
-        4000,
-        &["claim", "busy", "--repo", "ops", "--json"],
-    );
-    assert!(
-        wait_until_mutex_held(r, "ops", "busy", Duration::from_secs(3)),
-        "holder acquired the mutex"
-    );
+    // The holder signals once it HOLDS the lane mutex, then holds until released — the
+    // contender's refusal below cannot race the holder's completion.
+    let mut holder = spawn_held(r, "busy");
 
+    // The contender burns its full bounded mutex wait (the holder cannot proceed until
+    // we say so), then refuses deterministically.
     let out = run(
         r,
         Some("contender"),
@@ -164,29 +176,32 @@ fn mutex_contention_reports_busy() {
     assert_eq!(code(&out), 1, "contender times out as busy");
     assert_eq!(stdout_json(&out)["reason"], "mutex_busy");
 
-    holder.wait().unwrap();
+    holder.release();
+    let status = holder.wait().unwrap();
+    assert!(
+        status.success(),
+        "holder completes its claim after release: {status:?}"
+    );
+    assert_eq!(
+        read_lock(r, "ops", "busy").unwrap().instance,
+        "holder",
+        "the hold hook never corrupts the claim it rides"
+    );
 }
 
 #[test]
 fn sigkill_releases_the_lane_mutex() {
     let root = temp_root();
     let r = root.path();
-    // Holder would keep the mutex 8s; we SIGKILL it mid-hold.
-    let mut holder = spawn_holding(
-        r,
-        "holder",
-        8000,
-        &["claim", "crash", "--repo", "ops", "--json"],
-    );
-    assert!(
-        wait_until_mutex_held(r, "ops", "crash", Duration::from_secs(4)),
-        "holder acquired the mutex"
-    );
+    // The holder holds the mutex until released — which never happens: we SIGKILL it
+    // provably mid-hold (it cannot complete naturally before the kill).
+    let mut holder = spawn_held(r, "crash");
 
     holder.kill().expect("SIGKILL holder");
     holder.wait().unwrap();
 
-    // The kernel released the advisory lock on fd close at process death.
+    // The kernel released the advisory lock on fd close at process death; the holder
+    // died before writing any lock record.
     let out = run(
         r,
         Some("fresh"),
@@ -200,24 +215,19 @@ fn sigkill_releases_the_lane_mutex() {
     assert_eq!(read_lock(r, "ops", "crash").unwrap().instance, "fresh");
 }
 
-/// Poll the lane mutex file until a `try_lock` returns `WouldBlock` (the holder holds it).
-fn wait_until_mutex_held(root: &Path, repo: &str, lane: &str, timeout: Duration) -> bool {
+/// One-shot observable-state assertion: the lane mutex is held RIGHT NOW (`try_lock`
+/// returns `WouldBlock`). Deterministic after `wait_held`: the claim's RAII mutex guard
+/// spans the hold hook, so between `.held` appearing and `.release` being created the
+/// holder holds the flock continuously.
+fn assert_lane_mutex_held_now(root: &Path, repo: &str, lane: &str) {
     let path = root
         .join(repo)
         .join("mutexes")
         .join(format!("{lane}.mutex"));
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if let Ok(f) = File::open(&path) {
-            match f.try_lock() {
-                Err(TryLockError::WouldBlock) => return true, // held by the holder
-                Ok(()) => {
-                    let _ = f.unlock(); // not held yet — release and keep polling
-                }
-                Err(TryLockError::Error(_)) => {}
-            }
-        }
-        thread::sleep(Duration::from_millis(20));
+    let f = File::open(&path).expect("mutex file exists once held");
+    match f.try_lock() {
+        Err(TryLockError::WouldBlock) => {} // held by the holder — the invariant
+        Ok(()) => panic!("lane mutex unexpectedly free while holder signals held"),
+        Err(TryLockError::Error(e)) => panic!("mutex probe failed: {e}"),
     }
-    false
 }

@@ -41,7 +41,7 @@ pub fn run(root: &Path, instance: Option<&str>, args: &[&str]) -> Output {
     let mut c = Command::new(bin());
     c.args(args).arg("--lane-root").arg(root);
     c.env_remove("LANE_ROOT");
-    c.env_remove("LANE_TEST_HOLD_LANE_MUTEX_MS");
+    c.env_remove("LANE_TEST_HOLD_FILE");
     match instance {
         Some(i) => {
             c.env("LANE_INSTANCE", i);
@@ -53,20 +53,109 @@ pub fn run(root: &Path, instance: Option<&str>, args: &[&str]) -> Output {
     c.output().expect("spawn lane")
 }
 
-/// Spawn (do not wait) `lane <args>` with a lane-mutex hold of `hold_ms` so the process
-/// keeps the lane mutex while a sibling contends / it is SIGKILLed.
-pub fn spawn_holding(
-    root: &Path,
-    instance: &str,
-    hold_ms: u64,
-    args: &[&str],
-) -> std::process::Child {
+/// Spawn (do not wait) `lane <args>` wired to the ZER-83 handshake hold hook: the child
+/// signals `<base>.held` once it holds the lane mutex, then HOLDS the mutex until
+/// `<base>.release` exists — deterministic at any optimization level (no wall-clock
+/// windows). Markers live in a dedicated sync tempdir owned by the returned
+/// [`HoldingChild`], outside `$LANE_ROOT` (lane state stays byte-clean of test objects).
+pub fn spawn_holding(root: &Path, instance: &str, args: &[&str]) -> HoldingChild {
+    let sync_dir = tempfile::Builder::new()
+        .prefix("lane-holdsync-")
+        .tempdir_in(home())
+        .expect("sync tempdir under HOME");
+    let base = sync_dir.path().join("hold");
     let mut c = Command::new(bin());
     c.args(args).arg("--lane-root").arg(root);
     c.env_remove("LANE_ROOT");
     c.env("LANE_INSTANCE", instance);
-    c.env("LANE_TEST_HOLD_LANE_MUTEX_MS", hold_ms.to_string());
-    c.spawn().expect("spawn holding lane")
+    c.env("LANE_TEST_HOLD_FILE", &base);
+    let child = c.spawn().expect("spawn holding lane");
+    HoldingChild {
+        child,
+        base,
+        _sync_dir: sync_dir,
+    }
+}
+
+/// A spawned mutex-holding `lane` process plus the sync tempdir its handshake markers
+/// live in — ONE owner so no panic path can drop the tempdir before the holder observes
+/// the release marker. Success paths call [`release`](Self::release) + [`wait`](Self::wait)
+/// (or [`kill`](Self::kill) + `wait`) explicitly; [`Drop`] is the panic-path guarantee:
+/// signal release → bounded reap (≤5s; the holder polls at 10ms, so it exits within ~2
+/// ticks) → `kill` + reap as last resort → only then the owned tempdir drops. The
+/// holder-side 30s fail-safe remains solely for a SIGKILLed test runner.
+pub struct HoldingChild {
+    child: std::process::Child,
+    base: PathBuf,
+    _sync_dir: TempDir,
+}
+
+impl HoldingChild {
+    /// Wait (10ms poll) until the child signals it holds the lane mutex. A LIVENESS
+    /// bound on process spawn — not a race window: once `.held` exists, the mutex stays
+    /// held until [`release`](Self::release).
+    pub fn wait_held(&self, timeout: std::time::Duration) -> bool {
+        let held = self.held_path();
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if held.exists() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// Tell the holder to proceed (create the release marker).
+    pub fn release(&self) {
+        std::fs::write(self.release_path(), b"go\n").expect("write release marker");
+    }
+
+    /// SIGKILL the holder (the sigkill test's deliberate mid-hold crash).
+    pub fn kill(&mut self) -> io::Result<()> {
+        self.child.kill()
+    }
+
+    /// Reap the holder and return its exit status.
+    pub fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
+
+    fn held_path(&self) -> PathBuf {
+        marker(&self.base, "held")
+    }
+
+    fn release_path(&self) -> PathBuf {
+        marker(&self.base, "release")
+    }
+}
+
+impl Drop for HoldingChild {
+    fn drop(&mut self) {
+        // Best-effort: `kill`/`wait` on an already-reaped child is a no-op we ignore.
+        let _ = std::fs::write(self.release_path(), b"go\n");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return, // reaped — the owned tempdir may drop now
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// `<base>.<suffix>` handshake marker path (`hold` → `hold.held` / `hold.release`),
+/// byte-appended to the raw OS string — the EXACT mirror of `hold_at`'s `suffixed` in
+/// `src/lock/mod.rs` (no UTF-8 round-trip, no `with_extension` last-dot surgery). Keep
+/// the two in lockstep or the handshake dead-locks at the fail-safe.
+fn marker(base: &Path, suffix: &str) -> PathBuf {
+    let mut s = base.as_os_str().to_owned();
+    s.push(".");
+    s.push(suffix);
+    PathBuf::from(s)
 }
 
 pub fn code(out: &Output) -> i32 {
@@ -246,6 +335,7 @@ pub fn run_hook(args: &[&str]) -> Output {
     c.env_remove("LANE_ROOT");
     c.env_remove("LANE_INSTANCE");
     c.env_remove("LANE_HOOK_BYPASS");
+    c.env_remove("LANE_TEST_HOLD_FILE");
     c.output().expect("spawn lane hook")
 }
 
@@ -283,6 +373,7 @@ pub fn scratch_commit(dir: &Path, msg: &str, envs: &[(&str, &str)]) -> Output {
     c.env_remove("LANE_ROOT");
     c.env_remove("LANE_INSTANCE");
     c.env_remove("LANE_HOOK_BYPASS");
+    c.env_remove("LANE_TEST_HOLD_FILE");
     for (k, v) in envs {
         c.env(k, v);
     }

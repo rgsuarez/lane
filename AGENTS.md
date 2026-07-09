@@ -13,9 +13,9 @@ was **adopted machine-wide 2026-07-07** (Linear ZER-82; consumer doctrine in ele
 CLAUDE.md § MULTI-AGENT WORKTREE POLICY). Trust `git log` + `session-journals/` (newest
 first) over any stale pointer. Next = **0b (doctrine edits, gated) and 5 (migration
 tooling + installer)**. The north star (a local app that *replaces Vantage in daily
-orchestration*) is **not yet realized** — Vantage exit criteria remain open. Known flake
-quarantine: Linear ZER-83 (`tests/lock_concurrency.rs` release-profile timing) — do not
-entangle.
+orchestration*) is **not yet realized** — Vantage exit criteria remain open. The former
+ZER-83 release-profile flake quarantine is RETIRED: the suite is deterministic at any
+optimization level and `cargo test --release` is a stated gate (§ Test commands).
 **PERMANENT DESCOPE (2026-07-08 Commander directive): no tmux, no zeos, no pairing
 runtime, no overseer — zeos is retired.** Never resurrect `lane pair`, skill-wraps, or
 tmux integration.
@@ -101,6 +101,16 @@ by invocation; every local verb is byte-identical with the adapters unused.
   A completion is **never fabricated**; there is no auto-repair beyond trailing-fragment recovery.
 - **A refusal/malformed audit failure never changes the primary outcome** — the original
   exit code / `Reason` stands; the audit failure is surfaced as `audit_warning`/stderr.
+- **Refusal auditing is intentionally ASYMMETRIC** (ZER-83 adjudication): refused
+  `claim`s audit best-effort (`claim_refused` for `active_held`/`target_overlap`;
+  `malformed`/`identity` audit as `malformed`) because claim contention is the
+  cross-agent collision-forensics signal. Refused `renew`/`release`/`handoff`
+  (`not_owner`/`not_held`/`expired`) append NO audit event by design: they are
+  non-mutating owner-check refusals, already surfaced structurally to the caller, with
+  no contention information — the audit log is a write-ahead mutation journal plus
+  contention forensics, not a request log. Pinned by
+  `tests/lock_refusals.rs::refused_renew_and_release_append_no_audit_event`; symmetric
+  refusal events remain an open extension if forensic demand appears.
 - **Writes are atomic-visible**: free-lane via exclusive `hard_link`; takeover/renew via
   `rename`-over (never unlink-first), so a crash never leaves a torn or missing lock.
 
@@ -167,13 +177,28 @@ cargo fmt --check
 cargo build
 cargo test
 cargo test --all-features
+cargo test --release
 cargo clippy --all-targets -- -D warnings
 ```
 
+`cargo test --release` is a stated gate (ZER-83): the shipped binary is a release build,
+so consumers run release-profile tests as their acceptance check — the suite must be
+deterministic at ANY optimization level. Never fix a release-profile flake by widening a
+wall-clock window; synchronize on observable state.
+
 Concurrency/crash tests spawn the real binary as separate processes (exactly-one-winner,
-SIGKILL crash-release, mutex/audit contention). Fault tests inject the `FsOps`/`AuditSink`
-seams. Write-path tests put `$LANE_ROOT` under `$HOME` so the local-filesystem device
-check passes.
+SIGKILL crash-release, mutex/audit contention). The hold-dependent tests use the ZER-83
+handshake: `tests/common/mod.rs::spawn_holding` sets `LANE_TEST_HOLD_FILE=<base>` and the
+in-binary hook (`src/lock/mod.rs::test_hold_after_lane_mutex`, compiled unconditionally,
+inert when the variable is unset) signals `<base>.held` while holding the lane mutex,
+then holds until `<base>.release` exists (30s fail-safe). The hook is reachable only via
+`claim_core` (`claim`, and `start`'s composition); `spawn_holding` is the ONLY setter of
+the variable, the shared spawn helpers in `tests/common/mod.rs` (`run`, `run_hook`,
+`scratch_commit`) scrub it, and every claim-path spawn in the suite routes through
+`run()`. Any new helper that spawns the binary directly must scrub it too;
+`tests/lock_hold_hook.rs` pins that ordinary spawns stay inert. Fault tests inject the
+`FsOps`/`AuditSink` seams. Write-path tests put `$LANE_ROOT` under `$HOME` so the
+local-filesystem device check passes.
 
 ## GitOps gates
 
