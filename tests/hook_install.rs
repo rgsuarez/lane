@@ -35,7 +35,7 @@ fn print_full_script_shape() {
     assert_eq!(code(&out), 0, "{out:?}");
     let s = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(s.starts_with("#!/bin/sh"), "{s}");
-    assert!(s.contains("# >>> lane hook v1 >>>"), "{s}");
+    assert!(s.contains("# >>> lane hook v2 >>>"), "{s}");
     assert!(s.contains("# <<< lane hook <<<"), "{s}");
     assert!(s.contains(r#"lane check --path "$PWD""#), "{s}");
     assert!(!s.contains("--repo"), "{s}");
@@ -141,7 +141,12 @@ fn install_composes_after_foreign_hook() {
         "--json",
     ]);
     assert_eq!(code(&out), 0, "{out:?}");
-    assert_eq!(stdout_json(&out)["data"]["composed"], true);
+    let j = stdout_json(&out);
+    assert_eq!(j["data"]["composed"], true);
+    assert!(
+        j["data"]["warning"].is_null(),
+        "an echo-only foreign hook has no early exit — no warning: {j}"
+    );
     let body = std::fs::read_to_string(&hp).unwrap();
     assert!(
         body.starts_with(foreign),
@@ -150,6 +155,104 @@ fn install_composes_after_foreign_hook() {
     assert!(
         body.trim_end().ends_with("# <<< lane hook <<<"),
         "lane block LAST"
+    );
+}
+
+#[test]
+fn install_upgrades_v1_block_in_place() {
+    let (_p, repo) = scratch_repo();
+    let hp = hook_path(&repo);
+    let foreign = "#!/bin/sh\necho secret-scan-gate >&2\n";
+    let v1_block = "# >>> lane hook v1 >>>\n# lane pre-commit guard - managed by `lane hook`; do not edit inside the markers.\nold_lane_guard() { return 0; }\nold_lane_guard || exit 1\n# <<< lane hook <<<\n";
+    std::fs::write(&hp, format!("{foreign}{v1_block}")).unwrap();
+    let mut perms = std::fs::metadata(&hp).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&hp, perms).unwrap();
+    let rs = repo.to_str().unwrap();
+
+    let out = run_hook(&["hook", "install", "--git-repo", rs, "--json"]);
+    assert_eq!(code(&out), 0, "{out:?}");
+    let j = stdout_json(&out);
+    assert_eq!(j["data"]["replaced_own_block"], true);
+    let body = std::fs::read_to_string(&hp).unwrap();
+    assert!(body.starts_with(foreign), "foreign bytes preserved: {body}");
+    assert!(body.contains("# >>> lane hook v2 >>>"), "{body}");
+    assert!(!body.contains("# >>> lane hook v1 >>>"), "{body}");
+    assert!(
+        !body.contains("old_lane_guard"),
+        "old body replaced: {body}"
+    );
+    assert!(
+        body.contains("LANE_INSTANCE"),
+        "v2 identity pre-check present: {body}"
+    );
+
+    let status = run_hook(&["hook", "status", "--git-repo", rs, "--json"]);
+    let j = stdout_json(&status);
+    assert_eq!(j["data"]["script_version"], 2, "status reports the upgrade");
+}
+
+#[test]
+fn install_warns_on_early_exit_foreign_hook_and_status_repeats_it() {
+    let (_p, repo) = scratch_repo();
+    let hp = hook_path(&repo);
+    // The eleetai shape (ZER-90): a cheap short-circuit gate whose success path
+    // `exit 0`s before anything appended below it can run.
+    let foreign = "#!/bin/sh\nif [ -z \"$(git diff --cached --name-only)\" ]; then\n  exit 0  # Nothing relevant staged.\nfi\n";
+    std::fs::write(&hp, foreign).unwrap();
+    let mut perms = std::fs::metadata(&hp).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&hp, perms).unwrap();
+    let rs = repo.to_str().unwrap();
+
+    let out = run_hook(&["hook", "install", "--git-repo", rs, "--json"]);
+    assert_eq!(code(&out), 0, "warning-class, never a refusal: {out:?}");
+    let j = stdout_json(&out);
+    assert_eq!(j["data"]["composed"], true);
+    let w = j["data"]["warning"].as_str().expect("install warns");
+    assert!(w.contains("UNREACHABLE"), "{w}");
+    assert!(w.contains("early exit"), "{w}");
+
+    // status repeats the warning for the composed file.
+    let status = run_hook(&["hook", "status", "--git-repo", rs, "--json"]);
+    let j = stdout_json(&status);
+    assert_eq!(j["data"]["installed"], true);
+    let w = j["data"]["warning"].as_str().expect("status warns");
+    assert!(w.contains("UNREACHABLE"), "{w}");
+
+    // A re-install (the upgrade path) keeps warning too.
+    let again = run_hook(&["hook", "install", "--git-repo", rs, "--json"]);
+    assert_eq!(code(&again), 0, "{again:?}");
+    let j = stdout_json(&again);
+    assert_eq!(j["data"]["replaced_own_block"], true);
+    let w = j["data"]["warning"].as_str().expect("re-install warns");
+    assert!(w.contains("UNREACHABLE"), "{w}");
+}
+
+#[test]
+fn rollout_doc_carries_placement_law_not_end_placement() {
+    // ZER-90 was a DOCS defect: pin the fixed guidance so it cannot regress.
+    let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/HOOK_ROLLOUT.md"))
+        .expect("docs/HOOK_ROLLOUT.md exists");
+    assert!(
+        doc.contains("BEFORE any gate that can exit early"),
+        "placement law present"
+    );
+    assert!(
+        !doc.contains("at the END"),
+        "dead end-of-file placement guidance is gone"
+    );
+    assert!(
+        doc.contains("lane hook print --snippet"),
+        "consumers regenerate the (v2) snippet rather than copying stale text"
+    );
+    assert!(
+        !doc.contains("# >>> lane hook v1 >>>"),
+        "no literal v1 block pasted as guidance"
+    );
+    assert!(
+        doc.contains("--allow-empty"),
+        "acceptance smoke test documented"
     );
 }
 
@@ -202,8 +305,21 @@ fn managed_hookspath_refused_with_snippet() {
     assert!(e.contains("husky"), "{e}");
     assert!(e.contains(".husky/_"), "{e}");
     assert!(
-        e.contains("# >>> lane hook v1 >>>"),
-        "refusal carries the snippet: {e}"
+        e.contains("# >>> lane hook v2 >>>"),
+        "refusal carries the v2 snippet: {e}"
+    );
+    assert!(
+        !e.contains("lane hook v1"),
+        "no v1 text in prescriptive guidance: {e}"
+    );
+    // ZER-90: the paste-target guidance places the block BEFORE early-exit gates and
+    // demands the acceptance smoke test; the dead end-of-file guidance is gone.
+    assert!(e.contains("AFTER your secret-scan gate"), "{e}");
+    assert!(e.contains("BEFORE any gate that can exit early"), "{e}");
+    assert!(e.contains("--allow-empty"), "smoke-test line present: {e}");
+    assert!(
+        !e.contains("at the END"),
+        "dead placement guidance gone: {e}"
     );
 
     assert!(!hook_path(&repo).exists(), "no write into .git/hooks");
@@ -256,7 +372,7 @@ fn status_reports_before_and_after() {
     let after = run_hook(&["hook", "status", "--git-repo", rs, "--json"]);
     let j = stdout_json(&after);
     assert_eq!(j["data"]["installed"], true);
-    assert_eq!(j["data"]["script_version"], 1);
+    assert_eq!(j["data"]["script_version"], 2);
     assert_eq!(j["data"]["mode"], "advise");
     assert_eq!(j["data"]["foreign_hook"], false);
 

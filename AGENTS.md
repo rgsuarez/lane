@@ -144,13 +144,19 @@ print path.
   (`# >>> lane hook vN >>>` … `# <<< lane hook <<<`); managed `core.hooksPath`, symlink,
   dormant (non-executable), non-text, oversize, or marker-damaged files are refused
   (`hook_compose_refused`) with manual instructions. Writes are temp-in-same-dir +
-  chmod 0755 + atomic rename. The canonical script is `BLOCK_TEMPLATE` in `src/hook.rs`;
-  in a composed hook every path `return`s (never `exit 0` — that would skip the host's
-  later gates). Modes: `git config lane.hook.mode` = `advise` (default) | `enforce`;
-  `LANE_HOOK_BYPASS=1` bypasses LOUDLY; missing-binary/exit-2 postures are
-  warn-and-pass in advise, fail-closed in enforce — never silent-open. Residual to keep
-  documented: `git commit --no-verify` skips pre-commit (consumer doctrine forbids it
-  for agents). Rollout doctrine: `docs/HOOK_ROLLOUT.md`.
+  chmod 0755 + atomic rename. The canonical script is `BLOCK_TEMPLATE` in `src/hook.rs`
+  (v2, ZER-91); in a composed hook every path `return`s (never `exit 0` — that would
+  skip the host's later gates). Modes: `git config lane.hook.mode` = `advise` (default)
+  | `enforce`; `LANE_HOOK_BYPASS=1` bypasses LOUDLY in both modes. The block pre-checks
+  identity (`LANE_INSTANCE` unset/empty gets a distinct no-identity diagnosis + export
+  fix, never mislabeled "not covered"), and enforce maps exit classes to the host
+  taxonomy: **1 = coverage violation** (`lane check` exit 1), **2 = environment** (lane
+  missing / no identity / `lane check` exit ≥2); advise is warn-and-pass everywhere —
+  never silent-open, only a covered commit is silent. Placement doctrine (ZER-90): the
+  block goes AFTER the secret scan and BEFORE any gate that can exit 0 early;
+  install/status warn heuristically when a composed block may be unreachable. Residual
+  to keep documented: `git commit --no-verify` skips pre-commit (consumer doctrine
+  forbids it for agents). Rollout doctrine: `docs/HOOK_ROLLOUT.md`.
 
 ## Secrets policy
 

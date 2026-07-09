@@ -339,3 +339,227 @@ fn composed_foreign_gate_and_lane_gate_both_run() {
         "lane gate ran after it: {e}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ZER-91 regressions: distinct no-identity diagnosis + enforce exit classes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_identity_advise_names_identity_not_coverage() {
+    let (_p, repo, root) = scratch();
+    install(&repo);
+    let path = hook_test_path();
+    // LANE_INSTANCE deliberately absent from the overlay — scratch_commit's baseline
+    // scrub removes any ambient value, so the hook sees no identity at all.
+    let out = scratch_commit(
+        &repo,
+        "no identity advise",
+        &[
+            ("PATH", path.as_str()),
+            ("LANE_ROOT", root.path().to_str().unwrap()),
+        ],
+    );
+    assert!(out.status.success(), "advise must not block: {out:?}");
+    let e = stderr_of(&out);
+    assert!(e.contains("lane-hook: WARNING"), "{e}");
+    assert!(e.contains("no caller identity"), "{e}");
+    assert!(
+        e.contains("export LANE_INSTANCE="),
+        "carries the propagation fix: {e}"
+    );
+    assert!(
+        !e.contains("not covered"),
+        "identity failure must not be labeled a coverage failure: {e}"
+    );
+}
+
+#[test]
+fn no_identity_enforce_blocks_with_identity_cause() {
+    let (_p, repo, root) = scratch();
+    install(&repo);
+    set_enforce(&repo);
+    let path = hook_test_path();
+    let out = scratch_commit(
+        &repo,
+        "no identity enforce",
+        &[
+            ("PATH", path.as_str()),
+            ("LANE_ROOT", root.path().to_str().unwrap()),
+        ],
+    );
+    assert!(!out.status.success(), "enforce fails closed: {out:?}");
+    let e = stderr_of(&out);
+    assert!(e.contains("lane-hook: BLOCKED"), "{e}");
+    assert!(e.contains("no caller identity"), "{e}");
+    assert!(e.contains("export LANE_INSTANCE="), "{e}");
+    assert!(e.contains("LANE_HOOK_BYPASS=1"), "names the bypass: {e}");
+    assert!(
+        !e.contains("not covered"),
+        "identity failure must not be labeled a coverage failure: {e}"
+    );
+}
+
+/// Run the installed pre-commit hook DIRECTLY via `sh` from the repo toplevel (what git
+/// does), so the hook's own exit code is observable — `git commit` flattens any hook
+/// failure to its own exit, which cannot pin the 1-vs-2 taxonomy.
+fn run_hook_directly(repo: &Path, envs: &[(&str, &str)]) -> std::process::Output {
+    let mut c = std::process::Command::new("sh");
+    c.arg(".git/hooks/pre-commit");
+    c.current_dir(repo);
+    c.env_remove("LANE_ROOT");
+    c.env_remove("LANE_INSTANCE");
+    c.env_remove("LANE_HOOK_BYPASS");
+    for (k, v) in envs {
+        c.env(k, v);
+    }
+    c.output().expect("spawn sh pre-commit")
+}
+
+/// ZER-91 remediation 3: pin the full advise/enforce × outcome exit-code matrix.
+/// Enforce: 0 covered, 1 = genuine coverage violation, 2 = environment (no identity /
+/// lane missing / integrity-io). Advise: always 0. Bypass is LOUD in BOTH modes and
+/// only the covered success path is silent.
+#[test]
+fn hook_exit_class_matrix_is_pinned() {
+    let (_p, repo, root) = scratch();
+    install(&repo);
+    let path = hook_test_path();
+    let rootv = root.path().to_str().unwrap().to_string();
+    let sys_only = "/usr/bin:/bin"; // git + sh, no lane
+
+    let expect = |label: &str, out: &std::process::Output, code: i32, needle: &str| {
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "{label}: wrong exit class: {out:?}"
+        );
+        let e = String::from_utf8_lossy(&out.stderr);
+        if needle.is_empty() {
+            assert!(
+                !e.contains("lane-hook:"),
+                "{label}: expected silence, got: {e}"
+            );
+        } else {
+            assert!(e.contains(needle), "{label}: missing {needle:?} in: {e}");
+        }
+    };
+
+    // -------- enforce --------
+    set_enforce(&repo);
+    let out = run_hook_directly(
+        &repo,
+        &[
+            ("PATH", path.as_str()),
+            ("LANE_ROOT", rootv.as_str()),
+            ("LANE_INSTANCE", "a"),
+        ],
+    );
+    expect("enforce/uncovered", &out, 1, "lane-hook: BLOCKED");
+
+    let out = run_hook_directly(
+        &repo,
+        &[("PATH", path.as_str()), ("LANE_ROOT", rootv.as_str())],
+    );
+    expect("enforce/no-identity", &out, 2, "no caller identity");
+
+    let out = run_hook_directly(&repo, &[("PATH", sys_only), ("LANE_ROOT", rootv.as_str())]);
+    expect("enforce/lane-missing", &out, 2, "'lane' not found on PATH");
+
+    let out = run_hook_directly(
+        &repo,
+        &[
+            ("PATH", path.as_str()),
+            ("LANE_ROOT", "not/absolute"),
+            ("LANE_INSTANCE", "a"),
+        ],
+    );
+    expect("enforce/integrity", &out, 2, "exit 2, integrity/io");
+
+    let out = run_hook_directly(
+        &repo,
+        &[
+            ("PATH", path.as_str()),
+            ("LANE_ROOT", rootv.as_str()),
+            ("LANE_INSTANCE", "a"),
+            ("LANE_HOOK_BYPASS", "1"),
+        ],
+    );
+    expect("enforce/bypass", &out, 0, "lane-hook: BYPASSED");
+
+    // Claim the repo as "a": covered is exit 0 and fully silent.
+    let claim = run(
+        root.path(),
+        Some("a"),
+        &[
+            "claim",
+            "wt",
+            "--repo",
+            "scratch",
+            "--target",
+            repo.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code(&claim), 0, "claim setup failed: {claim:?}");
+    let out = run_hook_directly(
+        &repo,
+        &[
+            ("PATH", path.as_str()),
+            ("LANE_ROOT", rootv.as_str()),
+            ("LANE_INSTANCE", "a"),
+        ],
+    );
+    expect("enforce/covered", &out, 0, "");
+
+    // -------- advise (never blocks, never silent except covered) --------
+    assert!(scratch_git(&repo, &["config", "lane.hook.mode", "advise"])
+        .status
+        .success());
+    let out = run_hook_directly(
+        &repo,
+        &[
+            ("PATH", path.as_str()),
+            ("LANE_ROOT", rootv.as_str()),
+            ("LANE_INSTANCE", "b"), // foreign to a's claim: rc=1 class
+        ],
+    );
+    expect("advise/uncovered", &out, 0, "lane-hook: WARNING");
+
+    let out = run_hook_directly(
+        &repo,
+        &[("PATH", path.as_str()), ("LANE_ROOT", rootv.as_str())],
+    );
+    expect("advise/no-identity", &out, 0, "no caller identity");
+
+    let out = run_hook_directly(&repo, &[("PATH", sys_only), ("LANE_ROOT", rootv.as_str())]);
+    expect("advise/lane-missing", &out, 0, "'lane' not found on PATH");
+
+    let out = run_hook_directly(
+        &repo,
+        &[
+            ("PATH", path.as_str()),
+            ("LANE_ROOT", "not/absolute"),
+            ("LANE_INSTANCE", "a"),
+        ],
+    );
+    expect("advise/integrity", &out, 0, "exit 2, integrity/io");
+
+    let out = run_hook_directly(
+        &repo,
+        &[
+            ("PATH", path.as_str()),
+            ("LANE_ROOT", rootv.as_str()),
+            ("LANE_HOOK_BYPASS", "1"),
+        ],
+    );
+    expect("advise/bypass", &out, 0, "lane-hook: BYPASSED");
+
+    let out = run_hook_directly(
+        &repo,
+        &[
+            ("PATH", path.as_str()),
+            ("LANE_ROOT", rootv.as_str()),
+            ("LANE_INSTANCE", "a"),
+        ],
+    );
+    expect("advise/covered", &out, 0, "");
+}
