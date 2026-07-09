@@ -1,6 +1,9 @@
 //! ZER-83 ambient-scrub pin for the test hold hook — deliberately a SINGLE test in its
 //! own integration binary (own process), so the one `std::env::set_var` below has zero
-//! race surface against any other test.
+//! race surface against any other test. THAT single-test-per-binary shape is the
+//! load-bearing invariant: do not add a second `#[test]` to this file (parallel test
+//! threads + global env mutation would race), and no cleanup of the variable is needed —
+//! the process exits with the test.
 //!
 //! The hook (`src/lock/mod.rs::test_hold_after_lane_mutex`) is compiled unconditionally
 //! and gated only on `$LANE_TEST_HOLD_FILE` — a behavior-widening branch on the claim
@@ -43,6 +46,4 @@ fn ambient_hold_var_never_gates_ordinary_spawns() {
         read_lock(root.path(), "ops", "demo").unwrap().instance,
         "plain"
     );
-
-    std::env::remove_var("LANE_TEST_HOLD_FILE");
 }

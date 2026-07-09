@@ -144,18 +144,27 @@ fn audit_appends_never_interleave() {
     );
 }
 
+/// Spawn a claim-holder for `lane` on repo `ops`, wait for its held signal (a liveness
+/// bound on process spawn, not a race window), and assert the lane mutex is genuinely
+/// held — the shared preamble of every hold-dependent test, in one place so the bound
+/// and the invariant can never drift between them.
+fn spawn_held(r: &Path, lane: &str) -> HoldingChild {
+    let holder = spawn_holding(r, "holder", &["claim", lane, "--repo", "ops", "--json"]);
+    assert!(
+        holder.wait_held(Duration::from_secs(10)),
+        "holder signaled it acquired the mutex (liveness bound, not a race window)"
+    );
+    assert_lane_mutex_held_now(r, "ops", lane);
+    holder
+}
+
 #[test]
 fn mutex_contention_reports_busy() {
     let root = temp_root();
     let r = root.path();
     // The holder signals once it HOLDS the lane mutex, then holds until released — the
     // contender's refusal below cannot race the holder's completion.
-    let mut holder = spawn_holding(r, "holder", &["claim", "busy", "--repo", "ops", "--json"]);
-    assert!(
-        holder.wait_held(Duration::from_secs(10)),
-        "holder signaled it acquired the mutex (liveness bound, not a race window)"
-    );
-    assert_lane_mutex_held_now(r, "ops", "busy");
+    let mut holder = spawn_held(r, "busy");
 
     // The contender burns its full bounded mutex wait (the holder cannot proceed until
     // we say so), then refuses deterministically.
@@ -186,12 +195,7 @@ fn sigkill_releases_the_lane_mutex() {
     let r = root.path();
     // The holder holds the mutex until released — which never happens: we SIGKILL it
     // provably mid-hold (it cannot complete naturally before the kill).
-    let mut holder = spawn_holding(r, "holder", &["claim", "crash", "--repo", "ops", "--json"]);
-    assert!(
-        holder.wait_held(Duration::from_secs(10)),
-        "holder signaled it acquired the mutex (liveness bound, not a race window)"
-    );
-    assert_lane_mutex_held_now(r, "ops", "crash");
+    let mut holder = spawn_held(r, "crash");
 
     holder.kill().expect("SIGKILL holder");
     holder.wait().unwrap();

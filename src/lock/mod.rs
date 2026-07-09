@@ -449,20 +449,23 @@ pub(crate) fn audit_refusal(
     }
 }
 
-/// Test-only synchronization hook (ZER-83): runs while the lane mutex is HELD (the claim
-/// path calls it immediately after `LaneMutex::acquire`, with the RAII guard alive). When
-/// `$LANE_TEST_HOLD_FILE` is set, [`hold_at`] signals "mutex acquired" and holds until the
-/// spawning test says proceed — so a sibling process can deterministically observe
-/// contention / SIGKILL the holder mid-hold at ANY optimization level.
+/// Test-only synchronization hook (ZER-83): runs while the lane mutex is HELD —
+/// `claim_core` calls it immediately after the LANE `LaneMutex::acquire` (and nowhere
+/// else: never on the target-mutex acquire, so `.held` always means "lane mutex held"),
+/// with the RAII guard alive. `claim_core` backs both `claim` and the `start`
+/// composition. When `$LANE_TEST_HOLD_FILE` is set, [`hold_at`] signals "mutex acquired"
+/// and holds until the spawning test says proceed — so a sibling process can
+/// deterministically observe contention / SIGKILL the holder mid-hold at ANY
+/// optimization level.
 ///
 /// Compiled unconditionally ON PURPOSE: the previous `#[cfg(debug_assertions)]` gate meant
 /// release binaries ignored the hold entirely, making `cargo test --release` racy (the
 /// ZER-83 root cause). Production inertness: when the variable is unset — every real
-/// invocation — this is a single `env::var` miss (no syscall, no sleep, no filesystem
+/// invocation — this is a single `env::var_os` miss (no syscall, no sleep, no filesystem
 /// access; the identical getenv already ran in debug builds). `LANE_TEST_*` variables are
 /// test plumbing, never a supported user surface.
 pub(crate) fn test_hold_after_lane_mutex() {
-    if let Ok(base) = std::env::var("LANE_TEST_HOLD_FILE") {
+    if let Some(base) = std::env::var_os("LANE_TEST_HOLD_FILE") {
         if !base.is_empty() {
             hold_at(&base);
         }
@@ -472,20 +475,32 @@ pub(crate) fn test_hold_after_lane_mutex() {
 /// How long a test-held claim waits for the release marker before proceeding anyway —
 /// the FINAL backstop so a holder orphaned by a SIGKILLed test runner can never wedge a
 /// machine. Test-side cleanup (explicit release + the harness `HoldingChild` drop)
-/// reaps holders in milliseconds on every normal or panicking test path.
+/// reaps holders in milliseconds on every normal or panicking test path. Ordering
+/// invariant with the harness bounds (`tests/common/mod.rs`): the harness `wait_held`
+/// bound (10s) and `HoldingChild` drop-reap bound (5s) must stay WELL UNDER this
+/// constant, or a slow spawn could see the holder proceed on the fail-safe and
+/// reintroduce the completion race this hook exists to kill.
 const TEST_HOLD_FAILSAFE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Signal "lane mutex held" by creating `<base>.held`, then hold (keeping the caller's
 /// lane mutex guard alive) until `<base>.release` exists, polling at 10ms under
 /// [`TEST_HOLD_FAILSAFE`]. If the held marker cannot be written (e.g. the test's sync
 /// dir is gone), return immediately: the test can never observe us, so holding is
-/// pointless. The markers are test-provided plumbing, NOT lane state — the object-guard
-/// law (`guard_dir_chain`; no symlink-following checks on state components) does not
-/// apply to them, and a failure here can only make the spawning test fail loudly, never
-/// weaken a lock-safety property.
-fn hold_at(base: &str) {
-    let held = std::path::PathBuf::from(format!("{base}.held"));
-    let release = std::path::PathBuf::from(format!("{base}.release"));
+/// pointless. Marker names are built by byte-appending `.held`/`.release` to the raw
+/// OS string — the EXACT mirror of the harness's `marker()` in `tests/common/mod.rs`
+/// (no UTF-8 round-trip, no `with_extension` last-dot surgery), so producer and
+/// consumer can never disagree on a path. The markers are test-provided plumbing, NOT
+/// lane state — the object-guard law (`guard_dir_chain`; no symlink-following checks on
+/// state components) does not apply to them, and a failure here can only make the
+/// spawning test fail loudly, never weaken a lock-safety property.
+fn hold_at(base: &std::ffi::OsStr) {
+    let suffixed = |suffix: &str| {
+        let mut s = base.to_owned();
+        s.push(suffix);
+        std::path::PathBuf::from(s)
+    };
+    let held = suffixed(".held");
+    let release = suffixed(".release");
     if std::fs::write(&held, b"held\n").is_err() {
         return;
     }
@@ -1306,11 +1321,14 @@ mod tests {
     fn hold_hook_signals_held_and_returns_on_release() {
         let dir = tempfile::tempdir().expect("tempdir");
         let base = dir.path().join("hold");
-        let base_s = base.to_str().expect("utf-8 base");
-        std::fs::write(format!("{base_s}.release"), b"go\n").expect("pre-create release");
-        hold_at(base_s);
+        let mut release = base.as_os_str().to_owned();
+        release.push(".release");
+        std::fs::write(std::path::PathBuf::from(release), b"go\n").expect("pre-create release");
+        hold_at(base.as_os_str());
+        let mut held = base.as_os_str().to_owned();
+        held.push(".held");
         assert!(
-            std::path::Path::new(&format!("{base_s}.held")).exists(),
+            std::path::PathBuf::from(held).exists(),
             "hold_at signals the held marker"
         );
     }
@@ -1321,7 +1339,7 @@ mod tests {
     fn hold_hook_returns_when_marker_unwritable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let base = dir.path().join("no-such-subdir").join("hold");
-        hold_at(base.to_str().expect("utf-8 base"));
+        hold_at(base.as_os_str());
         // Reaching here at all IS the assertion (no 30s fail-safe wait, no panic).
     }
 

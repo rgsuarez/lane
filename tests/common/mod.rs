@@ -147,7 +147,10 @@ impl Drop for HoldingChild {
     }
 }
 
-/// `<base>.<suffix>` handshake marker path (`hold` → `hold.held` / `hold.release`).
+/// `<base>.<suffix>` handshake marker path (`hold` → `hold.held` / `hold.release`),
+/// byte-appended to the raw OS string — the EXACT mirror of `hold_at`'s `suffixed` in
+/// `src/lock/mod.rs` (no UTF-8 round-trip, no `with_extension` last-dot surgery). Keep
+/// the two in lockstep or the handshake dead-locks at the fail-safe.
 fn marker(base: &Path, suffix: &str) -> PathBuf {
     let mut s = base.as_os_str().to_owned();
     s.push(".");

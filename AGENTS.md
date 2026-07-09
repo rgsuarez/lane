@@ -191,10 +191,14 @@ SIGKILL crash-release, mutex/audit contention). The hold-dependent tests use the
 handshake: `tests/common/mod.rs::spawn_holding` sets `LANE_TEST_HOLD_FILE=<base>` and the
 in-binary hook (`src/lock/mod.rs::test_hold_after_lane_mutex`, compiled unconditionally,
 inert when the variable is unset) signals `<base>.held` while holding the lane mutex,
-then holds until `<base>.release` exists (30s fail-safe). Every other spawn helper scrubs
-the variable; `tests/lock_hold_hook.rs` pins that ordinary spawns stay inert. Fault tests
-inject the `FsOps`/`AuditSink` seams. Write-path tests put `$LANE_ROOT` under `$HOME` so
-the local-filesystem device check passes.
+then holds until `<base>.release` exists (30s fail-safe). The hook is reachable only via
+`claim_core` (`claim`, and `start`'s composition); `spawn_holding` is the ONLY setter of
+the variable, the shared spawn helpers in `tests/common/mod.rs` (`run`, `run_hook`,
+`scratch_commit`) scrub it, and every claim-path spawn in the suite routes through
+`run()`. Any new helper that spawns the binary directly must scrub it too;
+`tests/lock_hold_hook.rs` pins that ordinary spawns stay inert. Fault tests inject the
+`FsOps`/`AuditSink` seams. Write-path tests put `$LANE_ROOT` under `$HOME` so the
+local-filesystem device check passes.
 
 ## GitOps gates
 
