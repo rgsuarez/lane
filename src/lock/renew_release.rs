@@ -232,6 +232,16 @@ pub fn release_core(
     if rec.instance != p.instance {
         return Err(LaneError::Refused(RefusedReason::NotOwner));
     }
+    // Generation guard (Slice 4): under the lane mutex, a generation-bound caller
+    // (the close composition) refuses when the live record is a SUCCESSOR claim —
+    // same lane, same instance, different `claimed_at`. `not_held` is exact: the
+    // generation the caller bound to no longer exists. Strictly strengthens the
+    // owner-only release law; `None` (the plain verb) is byte-identical to before.
+    if let Some(expected) = p.expected_claimed_at {
+        if rec.claimed_at != expected {
+            return Err(LaneError::Refused(RefusedReason::NotHeld));
+        }
+    }
 
     let op_id = next_op_id();
     let mut intent = AuditEvent::new(

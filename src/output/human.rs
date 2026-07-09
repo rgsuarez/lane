@@ -20,8 +20,8 @@ pub fn render(board: &Board) -> String {
     } else {
         let _ = writeln!(
             out,
-            "{:<13} {:<18} {:<13} {:<18} {:<12} {:<30} {:<12}",
-            "KEY", "LANE", "REPO", "STALE", "LIVE", "BRANCH", "GATE"
+            "{:<13} {:<18} {:<13} {:<18} {:<12} {:<30} {:<12} {:<16} TITLE",
+            "KEY", "LANE", "REPO", "STALE", "LIVE", "BRANCH", "GATE", "STATE"
         );
         for r in &board.rows {
             let key = match &r.linear_key {
@@ -48,10 +48,25 @@ pub fn render(board: &Board) -> String {
                 Some(g) => format!("{}[{}]", gate_str(g.value), prov(g.provenance)),
                 None => "-".to_string(),
             };
+            // The Linear join (fixture or live): one provenance tag for the issue,
+            // shown on STATE; TITLE is last and deliberately untruncated. State/title
+            // are NETWORK-sourced — strip terminal control chars so a crafted issue
+            // title/state can't inject ANSI escapes or newlines into the board.
+            let (issue_state, issue_title) = match &r.linear {
+                Some(p) => (
+                    format!(
+                        "{}[{}]",
+                        crate::model::sanitize_terminal(&p.value.state),
+                        prov(p.provenance)
+                    ),
+                    crate::model::sanitize_terminal(&p.value.title),
+                ),
+                None => ("-".to_string(), "-".to_string()),
+            };
             let _ = writeln!(
                 out,
-                "{:<13} {:<18} {:<13} {:<18} {:<12} {:<30} {:<12}",
-                key, lane, repo, stale, live, branch, gate
+                "{:<13} {:<18} {:<13} {:<18} {:<12} {:<30} {:<12} {:<16} {}",
+                key, lane, repo, stale, live, branch, gate, issue_state, issue_title
             );
         }
     }
@@ -75,6 +90,7 @@ fn prov(p: Provenance) -> &'static str {
         Provenance::Authoritative => "A",
         Provenance::Derived => "D",
         Provenance::Fixture => "F",
+        Provenance::Live => "L",
         Provenance::Unknown => "U",
     }
 }
@@ -84,6 +100,7 @@ fn prov_full(p: Provenance) -> &'static str {
         Provenance::Authoritative => "authoritative",
         Provenance::Derived => "derived",
         Provenance::Fixture => "fixture",
+        Provenance::Live => "live",
         Provenance::Unknown => "unknown",
     }
 }

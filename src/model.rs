@@ -14,6 +14,9 @@ pub enum Provenance {
     Derived,
     /// Read from a fixture file (Slice 1 stand-in for a real provider).
     Fixture,
+    /// Fetched from the live network source (possibly via the TTL read cache) —
+    /// honest network provenance, distinct from locally-`Derived` values (Slice 4).
+    Live,
     /// Not determinable in this slice (e.g. liveness without overseer/tmux).
     Unknown,
 }
@@ -174,6 +177,31 @@ pub struct LinearIssueLite {
     pub url: String,
 }
 
+/// Strip terminal control characters (C0/C1/DEL — including ANSI ESC, CR, LF, BS)
+/// from a string bound for the human renderer. Slice 4's `lane pull` and
+/// `board --linear api` are the first paths where NETWORK-sourced text (Linear issue
+/// titles / workflow-state names, set by any workspace member and cached with plain
+/// serde) reaches stdout; without this a crafted title could emit escape sequences
+/// that overwrite, hide, or spoof other rows in the operator's terminal. Applying it
+/// to local/authoritative strings too is harmless.
+pub fn sanitize_terminal(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// One pulled Linear issue (Slice 4, `lane pull`). ADAPTER-NEUTRAL on purpose:
+/// defined here — not in `src/linear` — so the envelope layer (`src/lock`) can carry
+/// it in `VerbData::Pull` without referencing the adapter (the core source-scan law
+/// in `tests/no_network_guard.rs`). The adapter deserializes GraphQL straight into it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullIssue {
+    pub identifier: String,
+    pub title: String,
+    pub state: String,
+    pub state_type: String,
+    pub url: String,
+    pub updated_at: String,
+}
+
 /// One board row, keyed by Linear issue where available. Every claim-sourced fact
 /// is provenance-tagged: claim facts are authoritative; `age_secs` and `stale_state`
 /// are derived; provider facts carry the provider's provenance.
@@ -203,4 +231,26 @@ pub struct Board {
     pub generated_at: DateTime<Utc>,
     pub rows: Vec<BoardRow>,
     pub sources: Vec<SourceFreshness>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_terminal;
+
+    #[test]
+    fn sanitize_strips_control_chars_but_keeps_text() {
+        // The ESC control byte (and CR/LF/BS) are removed; the now-INERT ANSI parameter
+        // bytes (`[2K`) survive as harmless literal text, as does unicode.
+        let evil = "safe\x1b[2Ktitle\r\n\x08 — café";
+        let clean = sanitize_terminal(evil);
+        assert_eq!(clean, "safe[2Ktitle — café");
+        assert!(
+            !clean.contains('\x1b'),
+            "the ESC that arms the sequence is gone"
+        );
+        assert!(!clean.contains('\n'));
+        assert!(!clean.contains('\r'));
+        // A benign title is unchanged.
+        assert_eq!(sanitize_terminal("lane Slice 4"), "lane Slice 4");
+    }
 }

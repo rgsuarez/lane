@@ -48,6 +48,12 @@ pub fn next_op_id() -> String {
 /// The closed set of audit event kinds (§S2.10; Slice 3 adds the spec-anticipated
 /// `handoff` — a non-destructive owner-only status flip, audited like `renew` with a
 /// single terminal event, no intent/completion pair).
+///
+/// Slice 4 adds the two ADAPTER events (`secret_requested`, `linear_write`). They are
+/// single terminal events (remote state cannot be reconciled locally, so no
+/// intent/completion pair) appended to the ROOT-level `$LANE_ROOT/audit.log` — a file
+/// the core's recovery/reconciliation never reads (it only ever opens per-repo audit
+/// paths), so an adapter event can never fail-close a core mutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditEventKind {
@@ -61,6 +67,8 @@ pub enum AuditEventKind {
     Takeover,
     Malformed,
     AuditRecovery,
+    SecretRequested,
+    LinearWrite,
 }
 
 /// The closed set of audit outcomes.
@@ -103,6 +111,15 @@ pub struct AuditEvent {
     pub recovered_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub recovered_bytes: Option<u64>,
+    /// `secret_requested` only: the logical ROLE KEY that was resolved (e.g.
+    /// `linear_api`) — never the reference, never the value. Named `secret_role`
+    /// (not `role`) because the claim schema already uses `role` for the claim
+    /// role (executor|advisor); the spec §8 wording is refined accordingly.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub secret_role: Option<String>,
+    /// `linear_write` only: the Linear issue identifier the write targeted.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub linear_key: Option<String>,
 }
 
 impl AuditEvent {
@@ -132,6 +149,8 @@ impl AuditEvent {
             ttl_hours: None,
             recovered_path: None,
             recovered_bytes: None,
+            secret_role: None,
+            linear_key: None,
         }
     }
 }
@@ -482,6 +501,38 @@ mod tests {
         assert!(j.contains("\"event\":\"claim\""));
         assert!(!j.contains("note"));
         assert!(!j.contains("prior_instance"));
+        // Slice-4 additive fields are absent when None…
+        assert!(!j.contains("secret_role"));
+        assert!(!j.contains("linear_key"));
+    }
+
+    #[test]
+    fn adapter_event_kinds_serialize_snake_case_with_role_key_only() {
+        let mut ev = AuditEvent::new(
+            AuditEventKind::SecretRequested,
+            "-",
+            "-",
+            "inst",
+            AuditOutcome::Ok,
+            Utc::now(),
+        );
+        ev.secret_role = Some("linear_api".to_string());
+        let j = serde_json::to_string(&ev).unwrap();
+        assert!(j.contains("\"event\":\"secret_requested\""));
+        assert!(j.contains("\"secret_role\":\"linear_api\""));
+
+        let mut ev = AuditEvent::new(
+            AuditEventKind::LinearWrite,
+            "ops",
+            "lqos-1",
+            "inst",
+            AuditOutcome::Error,
+            Utc::now(),
+        );
+        ev.linear_key = Some("ZER-85".to_string());
+        let j = serde_json::to_string(&ev).unwrap();
+        assert!(j.contains("\"event\":\"linear_write\""));
+        assert!(j.contains("\"linear_key\":\"ZER-85\""));
     }
 
     #[test]

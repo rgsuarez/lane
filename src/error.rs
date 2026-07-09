@@ -46,6 +46,10 @@ pub enum RefusedReason {
     /// (managed `core.hooksPath`, symlink, non-executable / non-text / oversize file,
     /// damaged markers). One machine reason; the message carries the case detail.
     HookComposeRefused,
+    /// `close --draft-closeout`/`--post-closeout`: the claim records no `linear_key`,
+    /// so there is no Linear issue to draft against (run plain `close`, or re-claim
+    /// with `--linear-key`). Normally constructed as `RefusedMsg` with the fix text.
+    NoLinearKey,
 }
 
 impl RefusedReason {
@@ -63,6 +67,7 @@ impl RefusedReason {
             RefusedReason::ForeignOwner => Reason::ForeignOwner,
             RefusedReason::NoIdentity => Reason::NoIdentity,
             RefusedReason::HookComposeRefused => Reason::HookComposeRefused,
+            RefusedReason::NoLinearKey => Reason::NoLinearKey,
         }
     }
 }
@@ -82,10 +87,19 @@ pub enum LaneError {
     Identity(String),
     /// The resolved lane root is not on the local filesystem (exit 2).
     NonLocalRoot(String),
-    /// A claim or audit record could not be parsed, or violated its on-disk shape (exit 2).
+    /// A claim, audit, or config record could not be parsed, or violated its on-disk
+    /// shape (exit 2).
     Malformed { path: PathBuf, detail: String },
     /// Any underlying I/O error (exit 2).
     Io(io::Error),
+    /// A secret could not be resolved: `op` missing / not signed in / role unmapped /
+    /// env pointer unset / empty or non-UTF-8 value (exit 2). The message names the
+    /// role key and the actionable fix — NEVER a reference, a value, or `op` stderr.
+    SecretUnavailable(String),
+    /// A network-verb transport failure: connect/TLS/timeout, non-2xx HTTP, or a
+    /// GraphQL-level error (exit 2). The message is a closed classification — never a
+    /// response-body dump. Local verbs can never produce this.
+    Network(String),
 }
 
 /// The closed set of JSON `reason` values (snake_case). Present in the envelope iff
@@ -104,10 +118,13 @@ pub enum Reason {
     ForeignOwner,
     NoIdentity,
     HookComposeRefused,
+    NoLinearKey,
     Identity,
     Malformed,
     NonLocalRoot,
     Io,
+    SecretUnavailable,
+    Network,
 }
 
 impl LaneError {
@@ -118,7 +135,9 @@ impl LaneError {
             LaneError::Identity(_)
             | LaneError::NonLocalRoot(_)
             | LaneError::Malformed { .. }
-            | LaneError::Io(_) => 2,
+            | LaneError::Io(_)
+            | LaneError::SecretUnavailable(_)
+            | LaneError::Network(_) => 2,
         }
     }
 
@@ -131,6 +150,8 @@ impl LaneError {
             LaneError::NonLocalRoot(_) => Reason::NonLocalRoot,
             LaneError::Malformed { .. } => Reason::Malformed,
             LaneError::Io(_) => Reason::Io,
+            LaneError::SecretUnavailable(_) => Reason::SecretUnavailable,
+            LaneError::Network(_) => Reason::Network,
         }
     }
 }
@@ -182,6 +203,9 @@ impl fmt::Display for LaneError {
             LaneError::Refused(RefusedReason::HookComposeRefused) => {
                 write!(f, "refused: cannot compose the git hook safely")
             }
+            LaneError::Refused(RefusedReason::NoLinearKey) => {
+                write!(f, "refused: claim records no linear_key")
+            }
             LaneError::RefusedMsg { msg, .. } => write!(f, "refused: {msg}"),
             LaneError::Identity(m) => write!(f, "identity error: {m}"),
             LaneError::NonLocalRoot(m) => {
@@ -191,6 +215,8 @@ impl fmt::Display for LaneError {
                 write!(f, "malformed record at {}: {detail}", path.display())
             }
             LaneError::Io(e) => write!(f, "io error: {e}"),
+            LaneError::SecretUnavailable(m) => write!(f, "secret unavailable: {m}"),
+            LaneError::Network(m) => write!(f, "network error: {m}"),
         }
     }
 }
@@ -247,6 +273,10 @@ mod tests {
             .exit_code(),
             1
         );
+        assert_eq!(
+            LaneError::Refused(RefusedReason::NoLinearKey).exit_code(),
+            1
+        );
         assert_eq!(LaneError::Identity("x".into()).exit_code(), 2);
         assert_eq!(LaneError::NonLocalRoot("x".into()).exit_code(), 2);
         assert_eq!(
@@ -258,6 +288,8 @@ mod tests {
             2
         );
         assert_eq!(LaneError::Io(io::Error::other("z")).exit_code(), 2);
+        assert_eq!(LaneError::SecretUnavailable("x".into()).exit_code(), 2);
+        assert_eq!(LaneError::Network("x".into()).exit_code(), 2);
     }
 
     #[test]
@@ -287,6 +319,15 @@ mod tests {
             LaneError::Refused(RefusedReason::NoIdentity).reason(),
             Reason::NoIdentity
         );
+        assert_eq!(
+            LaneError::Refused(RefusedReason::NoLinearKey).reason(),
+            Reason::NoLinearKey
+        );
+        assert_eq!(
+            LaneError::SecretUnavailable("x".into()).reason(),
+            Reason::SecretUnavailable
+        );
+        assert_eq!(LaneError::Network("x".into()).reason(), Reason::Network);
     }
 
     #[test]
@@ -305,6 +346,12 @@ mod tests {
         assert_eq!(j, "\"no_identity\"");
         let j = serde_json::to_string(&Reason::HookComposeRefused).unwrap();
         assert_eq!(j, "\"hook_compose_refused\"");
+        let j = serde_json::to_string(&Reason::NoLinearKey).unwrap();
+        assert_eq!(j, "\"no_linear_key\"");
+        let j = serde_json::to_string(&Reason::SecretUnavailable).unwrap();
+        assert_eq!(j, "\"secret_unavailable\"");
+        let j = serde_json::to_string(&Reason::Network).unwrap();
+        assert_eq!(j, "\"network\"");
     }
 
     #[test]

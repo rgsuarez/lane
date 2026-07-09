@@ -25,6 +25,10 @@ use crate::lock::FsOps;
 
 const DIR_MODE: u32 = 0o700;
 
+/// The ROOT-level adapter audit filename. DOT-prefixed so it can never collide with a
+/// `--repo` directory (`validate_name` rejects names starting with a non-alphanumeric).
+pub const ROOT_AUDIT_FILE: &str = ".adapter-audit.log";
+
 /// A resolved, local, canonical lane root plus the expected owner uid.
 #[derive(Debug, Clone)]
 pub struct LaneRoot {
@@ -64,6 +68,15 @@ impl LaneRoot {
     }
     pub fn audit_path(&self, repo: &str) -> PathBuf {
         self.repo_dir(repo).join("audit.log")
+    }
+    /// The ROOT-level adapter audit file (`secret_requested` / `linear_write` events).
+    /// Distinct from every per-repo `audit_path` on purpose: core recovery and
+    /// intent-reconciliation only ever open per-repo audit files, which keeps adapter
+    /// events structurally unable to fail-close core mutations. The DOT-prefixed name
+    /// also cannot collide with any repo directory — `validate_name` rejects names that
+    /// start with a non-alphanumeric byte, so no `--repo` can ever be `.adapter-audit`.
+    pub fn root_audit_path(&self) -> PathBuf {
+        self.path.join(ROOT_AUDIT_FILE)
     }
     pub fn temp_path(&self, repo: &str, lane: &str, token: &str) -> PathBuf {
         self.locks_dir(repo)

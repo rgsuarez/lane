@@ -21,6 +21,18 @@ pub enum WorktreeSource {
     Git,
 }
 
+/// Board Linear-source selection (Slice 4). Same law as `WorktreeSource`: the live
+/// source is OPT-IN; the default board resolves no secret and touches no network.
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LinearSource {
+    /// No Linear enrichment (the offline default).
+    #[default]
+    Off,
+    /// Live Linear GraphQL per claimed `linear_key` (op-resolved key at call time;
+    /// fail-soft — a degraded source never stops the board; TTL-cached).
+    Api,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "lane",
@@ -48,6 +60,9 @@ pub enum Command {
     Status(StatusArgs),
     /// Read-only listing of claims (all namespaces, or one `--repo`).
     List(ListArgs),
+    /// List your assigned Linear issues (read-only network verb; TTL-cached; API key
+    /// resolved via 1Password `op` at call time, never persisted).
+    Pull(PullArgs),
     /// Read-only coverage verdict: does an active claim owned by this instance cover a
     /// path? (exit 0 covered; 1 refused: uncovered | foreign_owner | no_identity).
     Check(CheckArgs),
@@ -245,6 +260,24 @@ pub struct ListArgs {
     pub lane_root: Option<PathBuf>,
 }
 
+/// `lane pull [--limit N] [--refresh] [--json]` — the viewer's assigned Linear issues.
+/// Identity-free (the API key IS the viewer) and repo-less; needs only `$LANE_ROOT`
+/// for config + cache. A fresh cache serves with no secret resolved and no network
+/// touched; `--refresh` bypasses the cache read (and rewrites it on success).
+#[derive(Args, Debug)]
+pub struct PullArgs {
+    /// Maximum issues to list (Linear page cap 250).
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=250))]
+    pub limit: u32,
+    /// Bypass the read cache and fetch fresh.
+    #[arg(long)]
+    pub refresh: bool,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub lane_root: Option<PathBuf>,
+}
+
 /// `lane check [--path <p>] [--repo <ns>] [--json]` (read-only coverage verdict). The
 /// scan defaults to ALL namespaces — claim targets are machine-global paths, and
 /// namespace inference from a git toplevel basename is wrong inside worktrees; `--repo`
@@ -326,6 +359,15 @@ pub struct CloseArgs {
     /// Also remove the claim's git worktree (never forced; dirty refuses).
     #[arg(long)]
     pub remove_worktree: bool,
+    /// PURE PREVIEW: compose and print the redacted Linear closeout draft. Closes
+    /// nothing, posts nothing, resolves no secret, touches no network.
+    #[arg(long, conflicts_with_all = ["post_closeout", "remove_worktree"])]
+    pub draft_closeout: bool,
+    /// The explicit operator go for the gated Linear write: post the closeout
+    /// comment to the claim's linear_key issue (serialized, generation-guarded,
+    /// marker-deduped), then close. Composes with --remove-worktree.
+    #[arg(long)]
+    pub post_closeout: bool,
     #[arg(long)]
     pub json: bool,
     #[arg(long)]
@@ -355,6 +397,10 @@ pub struct BoardArgs {
     /// each targeted claim's path; fail-soft). A fixture flag overrides this.
     #[arg(long, value_enum, default_value_t = WorktreeSource::Off)]
     pub worktrees: WorktreeSource,
+    /// Linear source: `off` (default; offline) or `api` (live GraphQL per claimed
+    /// linear_key; op-resolved key; fail-soft; TTL-cached). `--linear-fixture` overrides.
+    #[arg(long, value_enum, default_value_t = LinearSource::Off)]
+    pub linear: LinearSource,
 }
 
 /// Resolve the lane root from the process environment: explicit flag, then

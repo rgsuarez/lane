@@ -4,18 +4,21 @@ Durable rules for any agent working in this repo. Read before editing. The full 
 is in `docs/lane_SPEC.md` and the master plan
 (`~/.claude/plans/plan-mode-build-the-gleaming-donut.md`).
 
-**Current status & next work (read on cold boot):** as-built = Slices 0a/1/2/3/**3.5**
+**Current status & next work (read on cold boot):** as-built = Slices 0a/1/2/3/3.5/**4**
 (offline locking core; git worktree adapter + `start`/`close`/`handoff`; commit guard
-`check` + `hook`, ZER-84; 227 tests at the 3.5 baseline). lane was **adopted machine-wide
-2026-07-07** (Linear ZER-82; consumer doctrine in eleetai CLAUDE.md § MULTI-AGENT
-WORKTREE POLICY). Trust `git log` + `session-journals/` (newest first) over any stale
-pointer. Next slice = **4 (Linear read adapter + 1Password + gated writes — nothing else)**,
-then 0b/5. The north star (a local app that *replaces Vantage in daily orchestration*) is
-**not yet realized** — Vantage exit criteria remain open. Known flake quarantine: Linear
-ZER-83 (`tests/lock_concurrency.rs` release-profile timing) — do not entangle.
+`check` + `hook`, ZER-84; **Linear read adapter + 1Password + gated closeout writes,
+ZER-85: `lane pull`, `board --linear api`, `close --draft-closeout|--post-closeout`,
+root adapter audit, claim-generation guard — 295 tests at the Slice-4 baseline**). lane
+was **adopted machine-wide 2026-07-07** (Linear ZER-82; consumer doctrine in eleetai
+CLAUDE.md § MULTI-AGENT WORKTREE POLICY). Trust `git log` + `session-journals/` (newest
+first) over any stale pointer. Next = **0b (doctrine edits, gated) and 5 (migration
+tooling + installer)**. The north star (a local app that *replaces Vantage in daily
+orchestration*) is **not yet realized** — Vantage exit criteria remain open. Known flake
+quarantine: Linear ZER-83 (`tests/lock_concurrency.rs` release-profile timing) — do not
+entangle.
 **PERMANENT DESCOPE (2026-07-08 Commander directive): no tmux, no zeos, no pairing
-runtime, no overseer — zeos is retired.** Slice 4 = Linear read adapter + 1Password +
-gated writes ONLY. Never resurrect `lane pair`, skill-wraps, or tmux integration.
+runtime, no overseer — zeos is retired.** Never resurrect `lane pair`, skill-wraps, or
+tmux integration.
 
 ## North star
 
@@ -51,7 +54,15 @@ heartbeat-file liveness). Those live **outside the locking core** and never make
 itself reach the network. Slice 3 added the first one: `src/git/` (local `git` shell-outs
 under a bounded wait) plus the `start`/`close` COMPOSITION verbs in `src/lifecycle.rs`,
 which orchestrate core primitives + the adapter and hold NO core mutex across a git spawn.
-The core (`src/lock/`) has no dependency on either.
+Slice 4 added `src/config` ($LANE_ROOT/config.toml, object-guarded read), `src/secrets`
+(`op` CLI spawns under a 60s bounded wait; `env:` pointer fallback) and `src/linear`
+(sync GraphQL over `ureq` — the crate's ONE allowlisted network dependency — plus the
+TTL cache, closeout draft composer, and the adapter-owned per-lane publish lock). The
+core (`src/lock/`) has no dependency on any of them: `tests/no_network_guard.rs` enforces
+the manifest law (FORBIDDEN + justified ADAPTER_ONLY allowlist) AND a source scan proving
+`src/lock/**` + `src/hook.rs` never import adapter modules or network-capable crates.
+Network verbs (`pull`, `board --linear api`, `close --draft/post-closeout`) are opt-in
+by invocation; every local verb is byte-identical with the adapters unused.
 
 ## Locking safety rules (do not weaken)
 
@@ -60,7 +71,12 @@ The core (`src/lock/`) has no dependency on either.
 - **No overlapping active targets in a repo** (canonical ancestor/descendant check).
 - **Never auto-steal an active claim.** Takeover only when expired or `--force`.
 - **`--force` exists only on `claim`** and **never bypasses the target-overlap scan**.
-  renew/release are strictly owner-only (no `--force`).
+  renew/release are strictly owner-only (no `--force`). Since Slice 4, release is
+  additionally **generation-guardable** (`ReleaseParams.expected_claimed_at`): the
+  `close` composition binds to the claim generation `(repo, lane, instance,
+  claimed_at)` it read, so a same-instance release+reclaim race can never have its
+  successor claim released (or its worktree removed) by a stale close. The plain
+  `release` verb passes `None` — byte-identical behavior.
 - **Every force / takeover / release is write-ahead audited** (fsync'd `intent` before the
   destructive mutation; `completion` after). A post-mutation audit failure is reported as
   success-with-`audit_warning`, never "mutation failed".
@@ -93,8 +109,10 @@ The core (`src/lock/`) has no dependency on either.
 `0` ok (incl. `release`/`close`/`status` of an absent lane, and `hook status`/`hook
 uninstall` of a not-installed repo). `1` refused
 (`active_held`/`not_owner`/`target_overlap`/`mutex_busy`/`expired`/`not_held`/
-`dirty_worktree`/`uncovered`/`foreign_owner`/`no_identity`/`hook_compose_refused`).
-`2` `identity`/`malformed`/`io`/`non_local_root` (plus Clap usage errors, human-only).
+`dirty_worktree`/`uncovered`/`foreign_owner`/`no_identity`/`hook_compose_refused`/
+`no_linear_key`).
+`2` `identity`/`malformed`/`io`/`non_local_root`/`secret_unavailable`/`network` (plus
+Clap usage errors, human-only).
 Under `--json`, exactly one versioned envelope is the sole stdout for every post-parse
 exit path. `LaneError::{exit_code,reason}` is the single authoritative mapping
 (`src/error.rs`); context-rich refusals ride `LaneError::RefusedMsg { reason, msg }`
@@ -129,6 +147,18 @@ print path.
 1Password (`op`) is the secret provider. Never read secret files, never log secrets /
 references / retrieval mechanics, never put secrets in lock files or the audit log. The
 claim `note` is non-secret but is still excluded from the audit log.
+
+As built (Slice 4, `src/secrets`): role keys in `$LANE_ROOT/config.toml
+[secrets.roles]` map to opaque references dispatched by scheme (`op://…` → `op read
+--no-newline` under a 60s bounded wait; `env:VARNAME` → the sanctioned env pointer).
+`SecretValue` has no Display/Serialize/Clone and a redacted Debug; `expose()` is called
+only at the Authorization-header construction. `op` stderr is classified then DROPPED
+(it can name vaults/items); every resolution appends one `secret_requested` event
+(role key + outcome + ts — never a value or reference) to the ROOT adapter audit
+(`$LANE_ROOT/audit.log`), which core recovery never reads. Closeout drafts are
+whitelist-by-construction (no `instance`, no `note`, no local paths) with a
+defense-in-depth scrub before any post. The transport refuses non-https `api_url`
+except loopback test fixtures.
 
 ## Test commands (all must be green before commit)
 

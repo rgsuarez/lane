@@ -8,13 +8,17 @@
 
 pub mod board;
 pub mod cli;
+pub mod config;
 pub mod error;
 pub mod git;
 pub mod hook;
 pub mod lifecycle;
+pub mod linear;
 pub mod lock;
 pub mod model;
 pub mod output;
+mod proc;
+pub mod secrets;
 
 pub use board::{assemble, classify_stale, BoardInputs};
 pub use error::{LaneError, Reason, RefusedReason};

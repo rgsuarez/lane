@@ -1,6 +1,9 @@
-//! Guards: the default Linear provider is offline, and the manifest declares no
-//! HTTP/network client dependency. No TOML parser and no new dependency — a plain
-//! text scan of `Cargo.toml` (included at compile time).
+//! Guards: the default Linear provider is offline; the LOCKING CORE is std-only and
+//! network-free. Since Slice 4 the crate's `[dependencies]` may contain exactly the
+//! `ADAPTER_ONLY` crates (each with a written justification), which only adapter
+//! modules may import — the manifest scan and the core source scan below enforce
+//! both halves of that law. The scans are plain text (compile-time `include_str!`
+//! for the manifest; `std::fs` walks for sources) — no TOML parser in this test.
 
 use chrono::Utc;
 use lane::board::linear::{LinearProvider, NoLinearProvider};
@@ -14,46 +17,165 @@ fn default_linear_provider_is_offline() {
     assert_eq!(freshness.provenance, Provenance::Unknown);
 }
 
+/// Adapter-only dependencies: allowed in `[dependencies]` for modules OUTSIDE the
+/// locking core. Each entry carries its justification; the source scan below pins
+/// where they may be imported. Growing this list is a DELIBERATE act (Slice-gated,
+/// justified in Cargo.toml and here).
+const ADAPTER_ONLY: &[(&str, &str)] = &[
+    (
+        "toml",
+        "Slice 4 (ZER-85): $LANE_ROOT/config.toml parsing for src/config.rs; parse-only, serde-native, network-free",
+    ),
+    (
+        "ureq",
+        "Slice 4 (ZER-85): sync-only HTTP for src/linear; blocking client, zero async runtime in its tree, rustls; importable ONLY outside the locking core",
+    ),
+];
+
+/// Never allowed anywhere in the manifest: HTTP clients (other than an ADAPTER_ONLY
+/// grant), async runtimes, embedded DBs, raw-syscall shims.
+const FORBIDDEN: &[&str] = &[
+    // HTTP / network (ureq moved to ADAPTER_ONLY in Slice 4 — the deliberate,
+    // justified amendment; everything else here stays banned crate-wide)
+    "reqwest",
+    "hyper",
+    "graphql_client",
+    "isahc",
+    "surf",
+    // async runtimes
+    "tokio",
+    "async-std",
+    "async_std",
+    "smol",
+    // embedded DB / KV
+    "rusqlite",
+    "sled",
+    "diesel",
+    "sqlx",
+    "rocksdb",
+    // raw-syscall shims (the core is std-only — no O_NOFOLLOW/libc path)
+    "libc",
+    "rustix",
+    "nix",
+];
+
 #[test]
 fn manifest_declares_no_http_network_deps() {
-    // Compile-time include of this crate's manifest; no runtime file IO, no TOML parser.
+    // Compile-time include of this crate's manifest; no runtime file IO.
     let manifest = include_str!("../Cargo.toml");
-    // The locking core is permanently offline and std-only: no network/HTTP client, no
-    // async runtime, no embedded DB, no raw-syscall shim. Adapters that add Git/Linear/
-    // 1Password/tmux/overseer are future, separately-gated slices that live OUTSIDE the
-    // core — they are not declared here.
-    const FORBIDDEN: &[&str] = &[
-        // HTTP / network
-        "reqwest",
-        "hyper",
-        "ureq",
-        "graphql_client",
-        "isahc",
-        "surf",
-        // async runtimes
-        "tokio",
-        "async-std",
-        "async_std",
-        "smol",
-        // embedded DB / KV
-        "rusqlite",
-        "sled",
-        "diesel",
-        "sqlx",
-        "rocksdb",
-        // raw-syscall shims (Slice 2 is std-only — no O_NOFOLLOW/libc path)
-        "libc",
-        "rustix",
-        "nix",
-    ];
+    // Sanity: the allowlist and the forbidden list are disjoint, and every allowlisted
+    // crate actually appears in the manifest (keeps the allowlist honest and pruned).
+    for (dep, _why) in ADAPTER_ONLY {
+        assert!(
+            !FORBIDDEN.contains(dep),
+            "`{dep}` cannot be both ADAPTER_ONLY and FORBIDDEN"
+        );
+        let declared = manifest
+            .lines()
+            .any(|line| line.split('=').next().map(str::trim).unwrap_or_default() == *dep);
+        assert!(
+            declared,
+            "ADAPTER_ONLY lists `{dep}` but Cargo.toml does not declare it — prune the allowlist"
+        );
+    }
     for line in manifest.lines() {
-        // A dependency line is `name = "..."` or `name = { ... }`; the key is left of `=`.
-        let key = line.split('=').next().map(str::trim).unwrap_or_default();
+        let trimmed = line.trim();
+        // Inline form: `name = "..."` / `name = { ... }` — key is left of `=`.
+        let key = trimmed.split('=').next().map(str::trim).unwrap_or_default();
+        // Dependency-TABLE form: `[dependencies.tokio]` / `[dev-dependencies.tokio]` —
+        // the banned name is the segment after the last `.` inside the header brackets.
+        let table_dep = trimmed
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .filter(|s| {
+                s.starts_with("dependencies.")
+                    || s.starts_with("dev-dependencies.")
+                    || s.starts_with("build-dependencies.")
+                    || s.contains("-dependencies.")
+            })
+            .and_then(|s| s.rsplit('.').next())
+            .unwrap_or_default();
+        // RENAME form: `alias = { package = "tokio", ... }` — the real crate is the
+        // quoted value of a `package =` key, which the bare-key check above misses.
+        let rename_pkg = trimmed
+            .strip_prefix("package")
+            .map(str::trim_start)
+            .and_then(|s| s.strip_prefix('='))
+            .map(|s| s.trim().trim_matches(['"', ' ']))
+            .unwrap_or_default();
         for dep in FORBIDDEN {
             assert!(
-                key != *dep,
-                "Cargo.toml must not declare the network client dependency `{dep}`"
+                key != *dep && table_dep != *dep && rename_pkg != *dep,
+                "Cargo.toml must not declare the network client dependency `{dep}` \
+                 (checked inline, [dependencies.<name>] table, and package=\"<name>\" rename forms)"
             );
         }
     }
+}
+
+/// The other half of the law: no DEFAULT-OFFLINE module imports an adapter module or
+/// an adapter-only/network crate. This covers the locking core (`src/lock/**`) and the
+/// commit guard (`src/hook.rs`) AND the other surfaces that must work with nothing else
+/// up — the git adapter, output rendering, the model, the shared spawn helper, and the
+/// CLI definitions. The legitimate adapter-consumers (`src/linear/**`, `src/secrets/**`,
+/// `src/config.rs`, `src/board/**`, `src/lifecycle.rs`, `src/main.rs`) are excluded by
+/// construction. A plain line scan (comment lines skipped), same spirit as the manifest.
+#[test]
+fn offline_sources_import_no_adapter_or_network_code() {
+    const BANNED_TOKENS: &[&str] = &[
+        "ureq",
+        "crate::linear",
+        "crate::secrets",
+        "crate::config",
+        "toml::",
+        "use toml",
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Directory roots whose ENTIRE subtree must stay offline.
+    let mut files = rs_files_under(&root.join("src/lock"));
+    files.extend(rs_files_under(&root.join("src/git")));
+    files.extend(rs_files_under(&root.join("src/output")));
+    // Individual offline files (their sibling modules are adapter-consumers).
+    for leaf in ["src/hook.rs", "src/model.rs", "src/proc.rs", "src/cli.rs"] {
+        files.push(root.join(leaf));
+    }
+    assert!(
+        files.len() > 8,
+        "source scan found suspiciously few offline files — walk is broken"
+    );
+    for file in files {
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", file.display()));
+        for (n, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            for token in BANNED_TOKENS {
+                assert!(
+                    !trimmed.contains(token),
+                    "{}:{}: default-offline module references `{token}` — these surfaces are \
+                     permanently offline and never import adapter modules or network-capable crates",
+                    file.display(),
+                    n + 1
+                );
+            }
+        }
+    }
+}
+
+/// Recursive `.rs` listing via std only.
+fn rs_files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read dir {}: {e}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            out.extend(rs_files_under(&path));
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+    out
 }

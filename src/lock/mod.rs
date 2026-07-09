@@ -143,6 +143,12 @@ pub struct ReleaseParams {
     pub repo: String,
     pub lane: String,
     pub instance: String,
+    /// Slice 4 generation guard: when set, the release only proceeds if the live
+    /// record's `claimed_at` equals this value — a caller that bound to a specific
+    /// claim GENERATION (the `close` composition) can never release a successor
+    /// claim of the same lane (same-instance release+reclaim race). `None` preserves
+    /// the plain `release` verb's behavior exactly.
+    pub expected_claimed_at: Option<DateTime<Utc>>,
 }
 
 /// Result of a release (`present` distinguishes a real removal from a no-op).
@@ -516,11 +522,28 @@ pub(crate) enum VerbData {
         worktree_removed: bool,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         skipped_missing_worktree: bool,
+        // Slice 4 gated-closeout fields (all None on a plain close):
+        #[serde(skip_serializing_if = "Option::is_none")]
+        closeout_draft: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        closeout_posted: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        closeout_already_posted: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        closeout_comment_url: Option<String>,
     },
     // Boxed: a `ClaimRecord` is far larger than the other variants (clippy large_enum_variant).
     Status(Box<StatusData>),
     List {
         rows: Vec<StatusData>,
+    },
+    // Slice 4: `lane pull`. Carries the ADAPTER-NEUTRAL `model::PullIssue` DTO — this
+    // module never references `crate::linear` (the core source-scan law); the adapter
+    // constructs the variant and emits through the same single-envelope path.
+    Pull {
+        issues: Vec<crate::model::PullIssue>,
+        source: &'static str,
+        fetched_at: DateTime<Utc>,
     },
     Check {
         path: String,
@@ -738,11 +761,73 @@ fn human_success(
                 expires_at.to_rfc3339()
             )
         }
-        ("close", Some(VerbData::Close { .. })) => match outcome {
-            Outcome::Released => format!("closed {lane}"),
-            _ => format!("{lane} was not held"),
-        },
+        (
+            "close",
+            Some(VerbData::Close {
+                closeout_draft,
+                closeout_posted,
+                closeout_already_posted,
+                closeout_comment_url,
+                ..
+            }),
+        ) => {
+            // Draft-preview mode: the draft IS the output (fenced), nothing closed.
+            if closeout_posted.is_none() && closeout_already_posted.is_none() {
+                if let Some(draft) = closeout_draft {
+                    return format!(
+                        "---\n{}\n---\ndraft only — not posted, nothing closed; to post: lane close {lane} --repo <repo> --post-closeout",
+                        draft.trim_end()
+                    );
+                }
+            }
+            let closeout = if closeout_already_posted == &Some(true) {
+                "; closeout already posted (marker found)".to_string()
+            } else if closeout_posted == &Some(true) {
+                match closeout_comment_url.as_deref() {
+                    Some(url) => format!("; closeout posted ({url})"),
+                    None => "; closeout posted".to_string(),
+                }
+            } else {
+                String::new()
+            };
+            match outcome {
+                Outcome::Released => format!("closed {lane}{closeout}"),
+                // A closeout may have been posted even when the claim vanished before
+                // release (post succeeds, then an external release races in): still
+                // surface the posted comment so the operator sees the Linear write.
+                _ => format!("{lane} was not held{closeout}"),
+            }
+        }
         ("close", None) => format!("{lane} was not held"),
+        (
+            "pull",
+            Some(VerbData::Pull {
+                issues,
+                source,
+                fetched_at,
+            }),
+        ) => {
+            // Network-sourced text: strip terminal control characters so a crafted
+            // Linear title/state can't inject ANSI escapes or newlines into stdout.
+            let mut lines: Vec<String> = issues
+                .iter()
+                .map(|i| {
+                    format!(
+                        "{:<11} {:<15} {}",
+                        crate::model::sanitize_terminal(&i.identifier),
+                        crate::model::sanitize_terminal(&i.state),
+                        crate::model::sanitize_terminal(&i.title)
+                    )
+                })
+                .collect();
+            let plural = if issues.len() == 1 { "" } else { "s" };
+            lines.push(format!(
+                "({} issue{plural}, {source}, fetched {})",
+                issues.len(),
+                fetched_at.to_rfc3339()
+            ));
+            lines.join("\n")
+        }
         ("status", Some(VerbData::Status(sd))) => {
             if sd.present {
                 let ss = sd
@@ -889,7 +974,7 @@ fn human_success(
 
 use crate::cli::{CheckArgs, ClaimArgs, HandoffArgs, ListArgs, ReleaseArgs, RenewArgs, StatusArgs};
 
-fn home_env() -> Option<String> {
+pub(crate) fn home_env() -> Option<String> {
     std::env::var("HOME").ok()
 }
 
@@ -1024,6 +1109,8 @@ fn run_release_at(args: &ReleaseArgs, now: DateTime<Utc>) -> i32 {
             repo: args.repo.clone(),
             lane: args.lane.clone(),
             instance,
+            // The plain verb releases whatever generation the owner currently holds.
+            expected_claimed_at: None,
         };
         let s = renew_release::release_core(&root, &params, now, &fs, &sink)?;
         let outcome = if s.present {

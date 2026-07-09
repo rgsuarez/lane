@@ -330,3 +330,68 @@ pub fn init_scratch_repo(dir: &Path) {
     git(&["-C", dir_s, "add", "-A"]);
     git(&["-C", dir_s, "commit", "-m", "seed"]);
 }
+
+// ---------------------------------------------------------------------------
+// Loopback HTTP fixture (Slice 4) — a std TcpListener speaking minimal HTTP/1.1,
+// shared by the linear transport / pull / board / gated-close tests. Zero dev-deps.
+// ---------------------------------------------------------------------------
+
+/// Serve `script.len()` sequential connections on 127.0.0.1. Each connection gets
+/// one full request captured (headers + Content-Length body) and one scripted
+/// `(status_line, body)` JSON response with `Connection: close`. Returns the
+/// GraphQL-ish URL and a handle yielding the raw captured request texts.
+pub fn serve_http(
+    script: Vec<(&'static str, String)>,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("addr");
+    let url = format!("http://{addr}/graphql");
+    let handle = std::thread::spawn(move || {
+        let mut captured = Vec::new();
+        for (status_line, body) in script {
+            let (mut stream, _) = listener.accept().expect("accept");
+            captured.push(read_full_request(&mut stream));
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            use std::io::Write;
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+        captured
+    });
+    (url, handle)
+}
+
+/// Read one HTTP/1.1 request: headers to CRLFCRLF, then Content-Length body bytes.
+pub fn read_full_request(stream: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        let n = stream.read(&mut chunk).expect("read request");
+        assert!(n > 0, "client closed before sending a full request");
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+    let content_length: usize = headers
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .map(|v| v.trim().parse().expect("content-length"))
+        .unwrap_or(0);
+    while buf.len() < header_end + content_length {
+        let n = stream.read(&mut chunk).expect("read body");
+        assert!(n > 0, "client closed mid-body");
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
