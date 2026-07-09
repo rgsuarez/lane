@@ -68,3 +68,19 @@ Files that reference Vantage LOE/lane/secret doctrine and will need rewriting in
 6. **Cost / cron-agent fleet / topology each explicitly retained-as-standalone-ops or retired** — a written disposition per capability, not a silent dependency.
 
 Until #1–#6, Vantage may run **read-only as a migration/archive source**; after, it is reference-only.
+
+## 6. Ratified residual dispositions (exit criterion 6 — closed 2026-07-09, ZER-87)
+
+Commander-ratified 2026-07-09 (delegation recorded in the LANEGAP campaign anchor). One line of consequence per capability:
+
+| Capability | Disposition | Operative consequence |
+|---|---|---|
+| Cost / resource attribution | **RETAINED as standalone ops** (on Vantage, unchanged) | Global doctrine § Resources & Cost stays live; ZER-52 tracks provider revival; cost polling survives the exit |
+| Cron-agent fleet | **RETAINED as standalone ops** (on Vantage, unchanged) | Wake loops, reporters, verify scheduled smokes keep running as Vantage agents; launchd `vantage.com.*` plists stay |
+| Topology / probes / machines | **RETIRED** | No probe infrastructure exists (verified 2026-07-09: none on Mac launchd, none on homebox systemd); the machines table is not a consumer surface |
+
+The two retentions deliberately SURVIVE the daily-orchestration exit; any future full-Vantage retirement must re-home them first. Recorded in global `~/.claude/CLAUDE.md` § Vantage same day.
+
+### §3 checklist status (2026-07-09)
+
+Rows 1–3: done by Operation CLEAN BREAK (2026-07-07). Row 4: both docs ARCHIVED to `~/.claude/docs/archive/` and their doctrine sections replaced with retired stubs (ZER-89). Row 5: OBE — zeos retired wholesale 2026-07 (permanent descope); no re-pointing, trees remain read-only reference. Row 6: workspace `~/projects-local/CLAUDE.md` satellite pointer fixed 2026-07-09; per-project residue handled as encountered. Row 7: unchanged (runtime state, not doctrine).
