@@ -200,6 +200,49 @@ fn renew_and_release_reject_not_owner() {
     assert_eq!(stdout_json(&out)["reason"], "not_owner");
 }
 
+/// Pins the DOCUMENTED refusal-audit asymmetry (ZER-83 adjudication): refused claims
+/// audit best-effort (`claim_refused` — the cross-agent contention signal), while
+/// refused renew/release are non-mutating owner-check refusals that append NO audit
+/// event by design (the audit log is a mutation journal + contention forensics, not a
+/// request log). If symmetric refusal events are ever added deliberately, update
+/// AGENTS.md + docs/lane_SPEC.md and this pin together.
+#[test]
+fn refused_renew_and_release_append_no_audit_event() {
+    let root = temp_root();
+    let r = root.path();
+    assert_eq!(
+        code(&run(
+            r,
+            Some("owner"),
+            &["claim", "demo", "--repo", "ops", "--json"]
+        )),
+        0
+    );
+    let baseline = read_audit(r, "ops").len();
+
+    let out = run(
+        r,
+        Some("intruder"),
+        &["renew", "demo", "--repo", "ops", "--json"],
+    );
+    assert_eq!(code(&out), 1);
+    assert_eq!(stdout_json(&out)["reason"], "not_owner");
+
+    let out = run(
+        r,
+        Some("intruder"),
+        &["release", "demo", "--repo", "ops", "--json"],
+    );
+    assert_eq!(code(&out), 1);
+    assert_eq!(stdout_json(&out)["reason"], "not_owner");
+
+    assert_eq!(
+        read_audit(r, "ops").len(),
+        baseline,
+        "refused renew/release are intentionally un-audited (documented asymmetry)"
+    );
+}
+
 #[test]
 fn renew_of_unheld_lane_is_refused_not_held() {
     let root = temp_root();
