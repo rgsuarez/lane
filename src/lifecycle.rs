@@ -189,10 +189,16 @@ pub(crate) fn run_start_at(args: &StartArgs, now: DateTime<Utc>, runner: &dyn Gi
             base,
             warning: precheck.device_warning.clone(),
         };
+        // ADVISORY, after the worktree exists and the claim already succeeded: `start` is the
+        // verb that CREATES the condition - `git worktree add` materializes tracked files only,
+        // so the just-created worktree has no install directory and its gates cannot run yet.
+        // Reporting it here, where the fresh path is known exactly, is the earliest possible
+        // moment. It never installs and never fails the verb.
+        let readiness = crate::lock::workspace_readiness_warning(&worktree);
         Ok((
             Outcome::Ok,
             Some(data),
-            join_warnings(vec![claim.audit_warning]),
+            join_warnings(vec![claim.audit_warning, readiness]),
         ))
     })();
     emit(args.json, "start", repo, lane, result)
