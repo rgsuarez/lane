@@ -293,6 +293,46 @@ pub(crate) fn scan_overlap(
     Ok(())
 }
 
+/// Lockfile -> the install directory that materializes it. Deliberately ecosystem-generic:
+/// the rule is "a lockfile DECLARES dependencies, its install directory MATERIALIZES them",
+/// so a workspace carrying the former and not the latter cannot run its own gates yet.
+const WORKSPACE_INSTALL_MARKERS: &[(&str, &str)] = &[
+    ("bun.lock", "node_modules"),
+    ("bun.lockb", "node_modules"),
+    ("package-lock.json", "node_modules"),
+    ("pnpm-lock.yaml", "node_modules"),
+    ("yarn.lock", "node_modules"),
+];
+
+/// ADVISORY ONLY: detect a workspace whose dependencies were never installed, and name the
+/// remedy in the same breath as the detection.
+///
+/// Why this lives in `lane`, a repo-agnostic coordination primitive: `lane claim` is the one
+/// command every executor runs before its first mutation, whatever created its worktree.
+/// `git worktree add` produces TRACKED FILES ONLY, so a fresh worktree has no install
+/// directory, and module resolution walking UP the tree finds nothing either. Every gate then
+/// fails with `Cannot find package '<name>' from '<file>'` - which is the SAME SHAPE as a
+/// genuine dependency-graph regression (a real 2026-07-25 daemon crash loop on this machine
+/// had that exact signature). Saying it once, here, at the universal chokepoint is what keeps
+/// the benign case from reading as the severe one, and the severe one from being waved off.
+///
+/// This DETECTS; it never installs. Running package installs would be scope creep into build
+/// tooling. Reporting that an agent cannot yet work in the directory it just claimed is
+/// coordination, which is this crate's job.
+pub fn workspace_readiness_warning(dir: &Path) -> Option<String> {
+    for (lockfile, install_dir) in WORKSPACE_INSTALL_MARKERS {
+        if dir.join(lockfile).is_file() && !dir.join(install_dir).exists() {
+            return Some(format!(
+                "workspace not bootstrapped: {lockfile} present but {install_dir}/ absent in {} \
+                 - install dependencies before running any gate; until then a gate failing with \
+                 \"Cannot find package\" is THIS, not a dependency-graph regression",
+                dir.display()
+            ));
+        }
+    }
+    None
+}
+
 /// Combine an optional reconciliation warning with an optional post-mutation audit warning.
 pub(crate) fn combine_warnings(a: Option<String>, b: Option<String>) -> Option<String> {
     match (a, b) {
@@ -782,6 +822,17 @@ fn run_claim_at(args: &ClaimArgs, now: DateTime<Utc>) -> i32 {
             ..Default::default()
         };
         let s = claim::claim_core(&root, &params, now, &fs, &sink)?;
+        // ADVISORY, and deliberately computed AFTER the claim has already succeeded: an
+        // unbootstrapped workspace must never fail, block, or wedge a claim. It rides the
+        // existing audit_warning channel, so a detection failure degrades to silence and the
+        // claim stands either way. Scope: the reserved --target when one was given, else the
+        // caller's cwd (an executor claims from the worktree it is about to work in).
+        let readiness = args
+            .target
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .and_then(|d| workspace_readiness_warning(&d));
         let data = VerbData::Claim {
             lane: s.lane,
             instance: s.instance,
@@ -789,7 +840,11 @@ fn run_claim_at(args: &ClaimArgs, now: DateTime<Utc>) -> i32 {
             forced: s.forced,
             prior_instance: s.prior_instance,
         };
-        Ok((Outcome::Ok, Some(data), s.audit_warning))
+        Ok((
+            Outcome::Ok,
+            Some(data),
+            combine_warnings(s.audit_warning, readiness),
+        ))
     })();
     emit(args.json, "claim", repo, lane, result)
 }
@@ -944,6 +999,10 @@ pub(crate) fn read_liveness() -> Liveness {
 mod tests {
     use super::*;
 
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
     #[test]
     fn error_stderr_surfaces_audit_warning() {
         let s = error_stderr(
@@ -978,5 +1037,67 @@ mod tests {
             combine_warnings(Some("a".into()), Some("b".into())).as_deref(),
             Some("a; b")
         );
+    }
+
+    /// A fresh `git worktree add` carries the lockfile (tracked) and not the install dir
+    /// (gitignored). That is exactly the state that must be reported.
+    #[test]
+    fn workspace_readiness_flags_lockfile_without_install_dir() {
+        let d = tempdir();
+        std::fs::write(d.path().join("bun.lock"), "{}").unwrap();
+        let w = workspace_readiness_warning(d.path()).expect("unbootstrapped workspace must warn");
+        // The detection is useless without the remedy and the disambiguation in the same breath:
+        // this message is the ONLY thing standing between the benign case and a misdiagnosed
+        // dependency-graph regression.
+        assert!(w.contains("bun.lock"), "names the lockfile it saw: {w}");
+        assert!(
+            w.contains("node_modules"),
+            "names the absent install dir: {w}"
+        );
+        assert!(w.contains("install dependencies"), "states the remedy: {w}");
+        assert!(
+            w.contains("Cannot find package"),
+            "disambiguates the error string: {w}"
+        );
+    }
+
+    #[test]
+    fn workspace_readiness_silent_when_bootstrapped_or_not_a_workspace() {
+        // installed -> silent
+        let d = tempdir();
+        std::fs::write(d.path().join("bun.lock"), "{}").unwrap();
+        std::fs::create_dir(d.path().join("node_modules")).unwrap();
+        assert_eq!(workspace_readiness_warning(d.path()), None);
+        // no lockfile at all -> not a workspace this check has any opinion about
+        let e = tempdir();
+        assert_eq!(workspace_readiness_warning(e.path()), None);
+        // a nonexistent directory must not panic or warn
+        assert_eq!(
+            workspace_readiness_warning(Path::new("/nonexistent/definitely/not/here")),
+            None
+        );
+    }
+
+    /// Every supported ecosystem marker is wired, so adding a pair to the table is the only
+    /// edit a new ecosystem needs.
+    #[test]
+    fn workspace_readiness_covers_every_marker() {
+        for (lockfile, install_dir) in WORKSPACE_INSTALL_MARKERS {
+            let d = tempdir();
+            std::fs::write(d.path().join(lockfile), "x").unwrap();
+            let w = workspace_readiness_warning(d.path())
+                .unwrap_or_else(|| panic!("{lockfile} must be detected"));
+            assert!(w.contains(lockfile));
+            assert!(w.contains(install_dir));
+        }
+    }
+
+    /// A lockfile that is a DIRECTORY (or any non-file) is not a lockfile; the check must not
+    /// manufacture a warning from it.
+    #[test]
+    fn workspace_readiness_ignores_non_file_lockfile() {
+        let d = tempdir();
+        std::fs::create_dir(d.path().join("bun.lock")).unwrap();
+        assert_eq!(workspace_readiness_warning(d.path()), None);
     }
 }

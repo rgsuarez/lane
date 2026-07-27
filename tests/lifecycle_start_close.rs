@@ -40,6 +40,67 @@ fn start_args<'a>(repo_path: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
     v
 }
 
+/// `start` is the verb that CREATES the unbootstrapped condition: `git worktree add` brings
+/// tracked files only, so a workspace whose lockfile is tracked and whose install directory is
+/// gitignored lands with dependencies missing and its gates unable to run. The advisory warning
+/// must fire here - the earliest possible moment, with the fresh path known exactly - and must
+/// never cost the verb anything: `start` still succeeds and still creates branch and worktree.
+#[test]
+fn start_warns_when_the_new_worktree_has_no_dependencies() {
+    let root = temp_root();
+    let r = root.path();
+    let area = scratch_area();
+    let repo = scratch_repo(area.path());
+    // A lockfile tracked in the repo, so every worktree gets it; the install dir is not tracked.
+    std::fs::write(repo.join("bun.lock"), "{}").unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .expect("git");
+    };
+    git(&["add", "bun.lock"]);
+    git(&[
+        "-c",
+        "user.name=Lane Test",
+        "-c",
+        "user.email=lane-test@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        "add lockfile",
+    ]);
+    let repo_s = repo.to_str().unwrap();
+
+    let out = run(r, Some("a"), &start_args(repo_s, &[]));
+    // The verb still succeeds - an advisory warning never wedges a claim or a launch.
+    assert_eq!(
+        code(&out),
+        0,
+        "start must succeed despite the advisory warning; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = stdout_json(&out);
+    assert_eq!(v["ok"], true);
+    let warning = v["audit_warning"].as_str().unwrap_or_default();
+    assert!(
+        warning.contains("workspace not bootstrapped"),
+        "start must report the unbootstrapped worktree it just created, got: {warning}"
+    );
+    assert!(
+        warning.contains("install dependencies"),
+        "remedy must ride with the detection: {warning}"
+    );
+    assert!(
+        warning.contains("Cannot find package"),
+        "the error-string ambiguity must be disambiguated here: {warning}"
+    );
+    // And the worktree really was created - the warning is additive, not a failure path.
+    assert!(std::path::Path::new(&format!("{repo_s}-lqos-9")).is_dir());
+}
+
 #[test]
 fn start_happy_creates_branch_worktree_and_lifecycle_claim() {
     let root = temp_root();
